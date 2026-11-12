@@ -1,0 +1,809 @@
+import Renderer from '../renderer.js'
+import type { WaveSurferOptions } from '../wavesurfer.js'
+
+declare global {
+  interface Window {
+    HTMLCanvasElement: typeof HTMLCanvasElement
+  }
+}
+
+const createAudioBuffer = (channels: number[][], duration = 1): AudioBuffer => {
+  return {
+    duration,
+    length: channels[0].length,
+    sampleRate: channels[0].length / duration,
+    numberOfChannels: channels.length,
+    getChannelData: (i: number) => Float32Array.from(channels[i]),
+    copyFromChannel: jest.fn(),
+    copyToChannel: jest.fn(),
+  } as unknown as AudioBuffer
+}
+
+describe('Renderer', () => {
+  let container: HTMLDivElement
+  let renderer: Renderer
+  const originalGetContext = window.HTMLCanvasElement.prototype.getContext
+  const originalToDataURL = window.HTMLCanvasElement.prototype.toDataURL
+  const originalToBlob = window.HTMLCanvasElement.prototype.toBlob
+
+  beforeAll(() => {
+    Object.defineProperty(window, 'devicePixelRatio', { value: 1, writable: true })
+
+    window.HTMLCanvasElement.prototype.getContext = jest.fn(() => ({
+      beginPath: jest.fn(),
+      rect: jest.fn(),
+      roundRect: jest.fn(),
+      moveTo: jest.fn(),
+      lineTo: jest.fn(),
+      closePath: jest.fn(),
+      fill: jest.fn(),
+      drawImage: jest.fn(),
+      fillRect: jest.fn(),
+      createLinearGradient: jest.fn(() => ({ addColorStop: jest.fn() })),
+      globalCompositeOperation: '',
+      canvas: { width: 100, height: 100 },
+    })) as any
+
+    window.HTMLCanvasElement.prototype.toDataURL = jest.fn(() => 'data:mock')
+    window.HTMLCanvasElement.prototype.toBlob = jest.fn((cb) => cb(new Blob([''])))
+  })
+
+  afterAll(() => {
+    window.HTMLCanvasElement.prototype.getContext = originalGetContext
+    window.HTMLCanvasElement.prototype.toDataURL = originalToDataURL
+    window.HTMLCanvasElement.prototype.toBlob = originalToBlob
+  })
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    container.id = 'root'
+    document.body.appendChild(container)
+    renderer = new Renderer({ container })
+  })
+
+  afterEach(() => {
+    renderer.destroy()
+    container.remove()
+    jest.clearAllMocks()
+  })
+
+  test('parentFromOptionsContainer accepts an element from another realm (e.g. an iframe)', () => {
+    const foreign = {
+      nodeType: 1,
+      nodeName: 'DIV',
+      namespaceURI: 'http://www.w3.org/1999/xhtml',
+      style: {},
+      appendChild: () => undefined,
+    } as unknown as HTMLElement
+    expect((renderer as any).parentFromOptionsContainer(foreign)).toBe(foreign)
+  })
+
+  test('parentFromOptionsContainer returns element and throws', () => {
+    expect((renderer as any).parentFromOptionsContainer(container)).toBe(container)
+    expect((renderer as any).parentFromOptionsContainer('#root')).toBe(container)
+    expect(() => (renderer as any).parentFromOptionsContainer('#missing')).toThrow()
+  })
+
+  test('initHtml creates shadow root', () => {
+    const [el, shadow] = (renderer as any).initHtml()
+    expect(el.shadowRoot).toBe(shadow)
+    expect(shadow.querySelector('.scroll')).not.toBeNull()
+  })
+
+  const initialHeightCases: [Partial<WaveSurferOptions>, number, string][] = [
+    [{}, 0, '128px'],
+    [{ height: 50 }, 0, '50px'],
+    [{ height: 240 }, 0, '240px'],
+    [{ height: 'auto' }, 100, '100px'],
+    [{ height: 'auto' }, 0, '128px'],
+    [{ height: 'auto', splitChannels: [{ overlay: false }] }, 200, '200px'],
+  ]
+
+  test('initHtml keeps style text constant across heights', () => {
+    const styleText = (renderer.getWrapper().getRootNode() as ShadowRoot).querySelector('style')!.textContent!
+
+    for (const [options, parentHeight] of initialHeightCases) {
+      const otherContainer = document.createElement('div')
+      Object.defineProperty(otherContainer, 'clientHeight', { configurable: true, get: () => parentHeight })
+      document.body.appendChild(otherContainer)
+      const otherRenderer = new Renderer({ ...options, container: otherContainer })
+      try {
+        const shadow = otherRenderer.getWrapper().getRootNode() as ShadowRoot
+        expect(shadow.querySelector('style')?.textContent).toBe(styleText)
+      } finally {
+        otherRenderer.destroy()
+        otherContainer.remove()
+      }
+    }
+
+    const canvasesRule = styleText.match(/:host \.canvases \{([^}]*)\}/)?.[1]
+    expect(canvasesRule).toBeDefined()
+    expect(canvasesRule).not.toContain('min-height')
+  })
+
+  test.each(initialHeightCases)(
+    'initHtml sets initial min-height for %j with parent height %i to %s',
+    (options, parentHeight, minHeight) => {
+      renderer.destroy()
+      Object.defineProperty(container, 'clientHeight', { configurable: true, get: () => parentHeight })
+      renderer = new Renderer({ ...options, container })
+
+      expect(renderer.getWrapper().querySelector<HTMLElement>('.canvases')?.style.minHeight).toBe(minHeight)
+    },
+  )
+
+  test('initHtml measures auto height before appending the renderer', () => {
+    renderer.destroy()
+    Object.defineProperty(container, 'clientHeight', {
+      configurable: true,
+      get: () => (container.children.length === 0 ? 100 : 300),
+    })
+    renderer = new Renderer({ container, height: 'auto' })
+
+    expect(renderer.getWrapper().querySelector<HTMLElement>('.canvases')?.style.minHeight).toBe('100px')
+  })
+
+  test('initHtml preserves the nonce without changing style text', () => {
+    const styleText = (renderer.getWrapper().getRootNode() as ShadowRoot).querySelector('style')!.textContent
+    renderer.destroy()
+    renderer = new Renderer({ container, cspNonce: 'abc' })
+
+    const style = (renderer.getWrapper().getRootNode() as ShadowRoot).querySelector('style')
+    expect(style?.getAttribute('nonce')).toBe('abc')
+    expect(style?.textContent).toBe(styleText)
+  })
+
+  test('getHeight calculates values', () => {
+    ;(renderer as any).audioData = { numberOfChannels: 2 }
+    expect((renderer as any).getHeight(undefined, undefined)).toBe(128)
+    expect((renderer as any).getHeight(50, undefined)).toBe(50)
+    container.style.height = '200px'
+    expect((renderer as any).getHeight('auto', [{ overlay: false }])).toBe(64)
+  })
+
+  test('createDelay resolves after time', async () => {
+    jest.useFakeTimers()
+    const delay = (renderer as any).createDelay(10)
+    const spy = jest.fn()
+    const p = delay().then(spy)
+    jest.advanceTimersByTime(10)
+    await p
+    expect(spy).toHaveBeenCalled()
+    jest.useRealTimers()
+  })
+
+  test('convertColorValues supports gradients', () => {
+    const result = (renderer as any).convertColorValues(['red', 'blue'])
+    expect(typeof result).toBe('object')
+    expect((renderer as any).convertColorValues('red')).toBe('red')
+  })
+
+  test('getPixelRatio returns positive', () => {
+    window.devicePixelRatio = 2
+    expect((renderer as any).getPixelRatio()).toBe(2)
+  })
+
+  test('renderBarWaveform and renderLineWaveform draw on context', () => {
+    const ctx = (renderer as any).canvasWrapper.ownerDocument.createElement('canvas').getContext('2d') as any
+    const data = [new Float32Array([0, 0.5, -0.5]), new Float32Array([0, -0.5, 0.5])]
+    ;(renderer as any).renderBarWaveform(data, {}, ctx, 1)
+    expect(ctx.beginPath).toHaveBeenCalled()
+    ;(renderer as any).renderLineWaveform(data, {}, ctx, 1)
+    expect(ctx.lineTo).toHaveBeenCalled()
+  })
+
+  test('renderWaveform chooses rendering path', () => {
+    const ctx = document.createElement('canvas').getContext('2d') as any
+    const data = [new Float32Array([0, 1])]
+    const spyBar = jest.spyOn(renderer as any, 'renderBarWaveform')
+    const spyLine = jest.spyOn(renderer as any, 'renderLineWaveform')
+    ;(renderer as any).renderWaveform(data, { barWidth: 1 }, ctx)
+    expect(spyBar).toHaveBeenCalled()
+    ;(renderer as any).renderWaveform(data, {}, ctx)
+    expect(spyLine).toHaveBeenCalled()
+  })
+
+  test('renderSingleCanvas appends canvases', () => {
+    const canvasContainer = document.createElement('div')
+    const progressContainer = document.createElement('div')
+    const data = [new Float32Array([0, 1])]
+    ;(renderer as any).renderSingleCanvas(data, {}, 10, 10, 0, canvasContainer, progressContainer)
+    expect(canvasContainer.querySelector('canvas')).not.toBeNull()
+    expect(progressContainer.querySelector('canvas')).not.toBeNull()
+  })
+
+  test('renderMultiCanvas draws and subscribes', () => {
+    const canvasContainer = document.createElement('div')
+    const progressContainer = document.createElement('div')
+    const data = [new Float32Array([0, 1])] as any
+    Object.defineProperty((renderer as any).scrollContainer, 'clientWidth', { configurable: true, value: 200 })
+    ;(renderer as any).renderMultiCanvas(data, { barWidth: 1 }, 200, 10, canvasContainer, progressContainer)
+    expect(canvasContainer.querySelector('canvas')).not.toBeNull()
+  })
+
+  test('renderChannel creates containers', () => {
+    const data = [new Float32Array([0, 1])]
+    ;(renderer as any).renderChannel(data, {}, 10, 0)
+    expect((renderer as any).canvasWrapper.children.length).toBeGreaterThan(0)
+  })
+
+  test('render processes audio buffer', async () => {
+    const buffer = createAudioBuffer([[0, 0.5, -0.5]])
+    const spy = jest.fn()
+    renderer.renderEpoch.subscribe(spy)
+    await renderer.render(buffer)
+    expect(spy).toHaveBeenCalled()
+  })
+
+  it('exposes visibleRange derived from scroll position and duration', async () => {
+    const buffer = createAudioBuffer([[0, 0.5, -0.5]], 60)
+    await renderer.render(buffer)
+    const range = renderer.getVisibleRange()
+    expect(range.value.startTime).toBe(0)
+    expect(range.value.endTime).toBeGreaterThan(0)
+  })
+
+  it('reports full duration as visibleRange when not scrollable', async () => {
+    const buffer = createAudioBuffer([[0, 0.5, -0.5]], 10)
+    renderer.zoom(0) // fillParent, not scrollable
+    await renderer.render(buffer)
+    expect((renderer as any).isScrollable.value).toBe(false)
+    expect(renderer.getVisibleRange().value).toEqual({ startTime: 0, endTime: 10 })
+  })
+
+  it('recomputes visibleRange when the underlying scroll position changes', async () => {
+    const buffer = createAudioBuffer([[0, 0.5, -0.5]], 100)
+    renderer.zoom(1000) // force isScrollable
+    await renderer.render(buffer)
+    // jsdom performs no layout, so scrollWidth/clientWidth are both 0 by
+    // default -- calculateScrollPercentages special-cases scrollWidth===0 to
+    // {startX: 0, endX: 1}, which is exactly what render() sees. Stub in
+    // sizes to exercise a real scroll delta.
+    const scrollContainer = (renderer as any).scrollContainer as HTMLElement
+    Object.defineProperty(scrollContainer, 'scrollWidth', { configurable: true, value: 1000 })
+    Object.defineProperty(scrollContainer, 'clientWidth', { configurable: true, value: 100 })
+
+    expect((renderer as any).isScrollable.value).toBe(true)
+
+    scrollContainer.scrollLeft = 500
+    scrollContainer.dispatchEvent(new Event('scroll'))
+
+    const range = renderer.getVisibleRange().value
+    expect(range.startTime).toBeCloseTo(50)
+    expect(range.endTime).toBeCloseTo(60)
+  })
+
+  it('keeps visibleRange reactive after a not-scrollable -> scrollable transition (zoom in from fit-to-width)', async () => {
+    // Regression test: the first render is NOT scrollable (default
+    // minPxPerSec: 0), so visibleRange's auto-tracked computed takes the
+    // early-return branch and collects no dependency on the scroll stream.
+    // isScrollable must be a tracked signal for the later zoom-in (same
+    // audio, so audioDuration.set is an Object.is no-op, and streamEpoch
+    // doesn't bump) to wake the computed up again -- with a plain field,
+    // visibleRange froze at {0, duration} and scrolling showed blank lazy
+    // canvases.
+    const buffer = createAudioBuffer([[0, 0.5, -0.5]], 100)
+    await renderer.render(buffer)
+    expect((renderer as any).isScrollable.value).toBe(false)
+    expect(renderer.getVisibleRange().value).toEqual({ startTime: 0, endTime: 100 })
+
+    const scrollContainer = (renderer as any).scrollContainer as HTMLElement
+    Object.defineProperty(scrollContainer, 'scrollWidth', { configurable: true, value: 1000 })
+    Object.defineProperty(scrollContainer, 'clientWidth', { configurable: true, value: 100 })
+
+    renderer.zoom(1000) // same duration, now scrollable
+    expect((renderer as any).isScrollable.value).toBe(true)
+
+    scrollContainer.scrollLeft = 500
+    scrollContainer.dispatchEvent(new Event('scroll'))
+
+    const range = renderer.getVisibleRange().value
+    expect(range.startTime).toBeCloseTo(50)
+    expect(range.endTime).toBeCloseTo(60)
+  })
+
+  test('reRender keeps scroll position', async () => {
+    const buffer = createAudioBuffer([[0, 0.5, -0.5]])
+    renderer.zoom(20)
+    await renderer.render(buffer)
+    renderer.setScroll(10)
+    renderer.reRender()
+    expect(renderer.getScroll()).toBe(10)
+  })
+
+  test('reRender keeps non-scroll position', async () => {
+    const buffer = createAudioBuffer([[0, 0.5, -0.5]])
+    renderer.zoom(0)
+    await renderer.render(buffer)
+    renderer.setScroll(10)
+    renderer.reRender()
+    expect(renderer.getScroll()).toBe(0)
+  })
+
+  test('zoom updates option', () => {
+    renderer.zoom(20)
+    expect((renderer as any).options.minPxPerSec).toBe(20)
+  })
+
+  test('setOptions with an explicit undefined width reverts to fill behavior', async () => {
+    const buffer = createAudioBuffer([[0, 0.5, -0.5]])
+    renderer.setOptions({ ...(renderer as any).options, width: 250 })
+    await renderer.render(buffer)
+    const scrollContainer = (renderer as any).scrollContainer as HTMLElement
+    expect(scrollContainer.style.width).toBe('250px')
+
+    // WaveSurfer.setOptions merges, so an absent key keeps the fixed width;
+    // an explicit `width: undefined` reaches the renderer as undefined and
+    // must clear the fixed width again.
+    renderer.setOptions({ ...(renderer as any).options, width: undefined })
+    expect(scrollContainer.style.width).toBe('')
+  })
+
+  test('scrollIntoView updates scroll', () => {
+    Object.defineProperty((renderer as any).scrollContainer, 'scrollWidth', { configurable: true, value: 100 })
+    Object.defineProperty((renderer as any).scrollContainer, 'clientWidth', { configurable: true, value: 50 })
+    renderer.renderProgress(0)
+    ;(renderer as any).scrollIntoView(0.8, 1)
+    expect(renderer.getScroll()).toBeGreaterThanOrEqual(0)
+  })
+
+  test('renderProgress clamps only at low zoom when auto-centering', () => {
+    ;(renderer as any).options.autoScroll = true
+    ;(renderer as any).options.autoCenter = true
+    ;(renderer as any).isScrollable.set(true)
+
+    const viewportWidth = 100
+    const lowZoomDuration = 2
+    const lowZoomScrollWidth = 200
+    const highZoomDuration = 1
+    const highZoomScrollWidth = 800
+
+    Object.defineProperty((renderer as any).scrollContainer, 'clientWidth', {
+      configurable: true,
+      value: viewportWidth,
+    })
+    ;(renderer as any).audioData = { duration: lowZoomDuration }
+    Object.defineProperty((renderer as any).scrollContainer, 'scrollWidth', {
+      configurable: true,
+      value: lowZoomScrollWidth,
+    })
+    renderer.setScroll(0)
+    renderer.renderProgress(0.35, true)
+    // 200 / 2 = 100 px/s, so low zoom keeps Math.min(20, 10) = 10
+    expect(renderer.getScroll()).toBe(10)
+    ;(renderer as any).audioData = { duration: highZoomDuration }
+    Object.defineProperty((renderer as any).scrollContainer, 'scrollWidth', {
+      configurable: true,
+      value: highZoomScrollWidth,
+    })
+    renderer.setScroll(0)
+    renderer.renderProgress(0.0875, true)
+    // 800 / 1 = 800 px/s, so high zoom applies no clamp and scrolls by the full center offset
+    expect(renderer.getScroll()).toBe(20)
+  })
+
+  test('auto-centering keeps up with a cursor moving faster than the smoothing step', () => {
+    ;(renderer as any).options.autoScroll = true
+    ;(renderer as any).options.autoCenter = true
+    ;(renderer as any).isScrollable.set(true)
+    Object.defineProperty((renderer as any).scrollContainer, 'clientWidth', { configurable: true, value: 100 })
+    Object.defineProperty((renderer as any).scrollContainer, 'scrollWidth', { configurable: true, value: 1000 })
+    // 1000 px over 2 s = 500 px/s, within the smoothed range
+    ;(renderer as any).audioData = { duration: 2 }
+    renderer.setScroll(0)
+    renderer.renderProgress(0.05, true) // cursor at 50, centre of the view
+    const before = renderer.getScroll()
+    renderer.renderProgress(0.065, true) // cursor moves 15 px, more than the 10 px step
+    expect(renderer.getScroll() - before).toBe(15)
+  })
+
+  test('auto-centering leaves the cursor centered after a forward seek during playback', () => {
+    ;(renderer as any).options.autoScroll = true
+    ;(renderer as any).options.autoCenter = true
+    ;(renderer as any).isScrollable.set(true)
+    Object.defineProperty((renderer as any).scrollContainer, 'clientWidth', { configurable: true, value: 100 })
+    Object.defineProperty((renderer as any).scrollContainer, 'scrollWidth', { configurable: true, value: 1000 })
+    // 1000 px over 2 s = 500 px/s, within the smoothed range
+    ;(renderer as any).audioData = { duration: 2 }
+    renderer.setScroll(0)
+    renderer.renderProgress(0.05, true) // cursor at 50, the center of the view
+    renderer.renderProgress(0.5, true) // seek to 500, out of view: the view moves to center it
+    expect(renderer.getScroll()).toBe(450)
+  })
+
+  test('auto-centering catches up a step at a time with a cursor that starts playing off-center', () => {
+    ;(renderer as any).options.autoScroll = true
+    ;(renderer as any).options.autoCenter = true
+    ;(renderer as any).isScrollable.set(true)
+    Object.defineProperty((renderer as any).scrollContainer, 'clientWidth', { configurable: true, value: 128 })
+    Object.defineProperty((renderer as any).scrollContainer, 'scrollWidth', { configurable: true, value: 1024 })
+    // 1024 px over 2 s = 512 px/s, within the smoothed range
+    ;(renderer as any).audioData = { duration: 2 }
+    renderer.setScroll(0)
+    renderer.renderProgress(96 / 1024) // paused, cursor clicked to 96, 32 px right of center
+    renderer.renderProgress(112 / 1024, true) // playing, cursor moves 16 px, now 48 px right of center
+    // The view moves at most the 10 px step more than the cursor did, not all the way to it
+    expect(renderer.getScroll()).toBe(26)
+    renderer.renderProgress(128 / 1024, true)
+    renderer.renderProgress(144 / 1024, true)
+    renderer.renderProgress(160 / 1024, true)
+    expect(renderer.getScroll()).toBe(96) // cursor at 160, the center of the view
+  })
+
+  test('auto-centering measures movement since the previous update, even one that did not scroll', () => {
+    ;(renderer as any).options.autoScroll = true
+    ;(renderer as any).options.autoCenter = true
+    ;(renderer as any).isScrollable.set(true)
+    Object.defineProperty((renderer as any).scrollContainer, 'clientWidth', { configurable: true, value: 128 })
+    Object.defineProperty((renderer as any).scrollContainer, 'scrollWidth', { configurable: true, value: 1024 })
+    // 1024 px over 2 s = 512 px/s, within the smoothed range
+    ;(renderer as any).audioData = { duration: 2 }
+    renderer.setScroll(0)
+    renderer.renderProgress(64 / 1024, true) // cursor at 64, the center of the view
+    // Auto-scroll off for three updates of 16 px: the view stays where it is
+    ;(renderer as any).options.autoScroll = false
+    renderer.renderProgress(80 / 1024, true)
+    renderer.renderProgress(96 / 1024, true)
+    renderer.renderProgress(112 / 1024, true)
+    ;(renderer as any).options.autoScroll = true
+    renderer.renderProgress(128 / 1024, true) // cursor moves 16 px, now 64 px right of center
+    // The step counts only those 16 px, not the 64 since the last scroll
+    expect(renderer.getScroll()).toBe(26)
+  })
+
+  test('auto-centering keeps the cursor centered when zoomed out during playback', () => {
+    ;(renderer as any).options.autoScroll = true
+    ;(renderer as any).options.autoCenter = true
+    ;(renderer as any).isScrollable.set(true)
+    const container = (renderer as any).scrollContainer
+    Object.defineProperty(container, 'clientWidth', { configurable: true, value: 100 })
+    Object.defineProperty(container, 'scrollWidth', { configurable: true, value: 4096 })
+    // 4096 px over 8 s = 512 px/s, within the smoothed range
+    ;(renderer as any).audioData = { duration: 8 }
+    renderer.setScroll(0)
+    renderer.renderProgress(0.5, true) // cursor at 2048, centered: the view starts at 1998
+    // Zoomed out to 256 px/s, the cursor kept where it was on screen
+    Object.defineProperty(container, 'scrollWidth', { configurable: true, value: 2048 })
+    renderer.setScroll(974)
+    renderer.renderProgress(0.5078125, true) // cursor moves 16 px at the new zoom
+    expect(renderer.getScroll()).toBe(990) // cursor at 1040, the center of the view
+  })
+
+  test('auto-centering does not fall behind when the browser scrolls by whole pixels only', () => {
+    ;(renderer as any).options.autoScroll = true
+    ;(renderer as any).options.autoCenter = true
+    ;(renderer as any).isScrollable.set(true)
+    const container = (renderer as any).scrollContainer
+    let scrollLeft = 0
+    Object.defineProperty(container, 'scrollLeft', {
+      configurable: true,
+      get: () => scrollLeft,
+      set: (value: number) => (scrollLeft = Math.round(value)),
+    })
+    Object.defineProperty(container, 'clientWidth', { configurable: true, value: 100 })
+    Object.defineProperty(container, 'scrollWidth', { configurable: true, value: 4000 })
+    // 4000 px over 10 s = 400 px/s; at 30 updates a second the cursor moves 13.33 px each
+    ;(renderer as any).audioData = { duration: 10 }
+    renderer.renderProgress(0.5, true)
+    for (let i = 1; i <= 30; i++) {
+      renderer.renderProgress(0.5 + i / 300, true)
+    }
+    // The cursor is at 2400 after a second, within half a pixel of the center
+    expect(Math.abs(2400 - scrollLeft - 50)).toBeLessThanOrEqual(0.5)
+  })
+
+  test('renderProgress updates styles', () => {
+    renderer.renderProgress(0.5)
+    expect((renderer as any).progressWrapper.style.width).toBe('50%')
+  })
+
+  test('exportImage returns data', async () => {
+    const canvas = document.createElement('canvas')
+    ;(renderer as any).canvasWrapper.appendChild(canvas)
+    const urls = await renderer.exportImage('image/png', 1, 'dataURL')
+    expect(urls).toHaveLength(1)
+    const blobs = await renderer.exportImage('image/png', 1, 'blob')
+    expect(blobs).toHaveLength(1)
+  })
+
+  test('destroy cleans up', () => {
+    renderer.destroy()
+    expect(container.contains(renderer.getWrapper())).toBe(false)
+  })
+
+  test('destroy is terminal: scope stays disposed, decoded audio released, visibleRange safe to read', async () => {
+    const buffer = createAudioBuffer([[0, 0.5, -0.5]], 100)
+    renderer.zoom(1000)
+    await renderer.render(buffer)
+
+    renderer.destroy()
+
+    // The scope is disposed and NOT recreated -- a late registration runs
+    // (and is released) immediately, so nothing can leak past destroy.
+    expect((renderer as any).scope.disposed).toBe(true)
+    const late = jest.fn()
+    ;(renderer as any).scope.add(late)
+    expect(late).toHaveBeenCalledTimes(1)
+
+    // The decoded audio reference is released (a destroyed-but-referenced
+    // renderer must not pin a multi-megabyte AudioBuffer).
+    expect((renderer as any).audioData).toBeNull()
+
+    // scrollStream is torn down, but reading visibleRange must not throw.
+    expect((renderer as any).scrollStream).toBeNull()
+    expect(() => renderer.getVisibleRange().value).not.toThrow()
+  })
+
+  test('input listeners are dead after destroy', async () => {
+    const localContainer = document.createElement('div')
+    document.body.appendChild(localContainer)
+    const localRenderer = new Renderer({ container: localContainer })
+    const clickSpy = jest.fn()
+    localRenderer.clickSignal.subscribe(clickSpy)
+
+    const wrapper = (localRenderer as any).wrapper as HTMLElement
+    wrapper.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 100, height: 50, right: 100, bottom: 50 }) as DOMRect
+    wrapper.dispatchEvent(new MouseEvent('click', { clientX: 10, clientY: 10 }))
+    expect(clickSpy).toHaveBeenCalledTimes(1)
+
+    localRenderer.destroy()
+    wrapper.dispatchEvent(new MouseEvent('click', { clientX: 10, clientY: 10 }))
+    expect(clickSpy).toHaveBeenCalledTimes(1) // no further delivery post-destroy
+    localContainer.remove()
+  })
+
+  it('cancels a pending resize debounce on destroy even after a render', async () => {
+    // The debounce delay() is created once in initEvents(), but render()
+    // replaces delayScope; its cancellation must re-register per call or
+    // destroy() cannot cancel a debounce scheduled after the first render.
+    jest.useFakeTimers()
+    let roCallback: (() => void) | undefined
+    const OriginalRO = (global as any).ResizeObserver
+    ;(global as any).ResizeObserver = class {
+      constructor(cb: () => void) {
+        roCallback = cb
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    const resizeSpy = jest.spyOn(Renderer.prototype as any, 'onContainerResize')
+    const localContainer = document.createElement('div')
+    document.body.appendChild(localContainer)
+    const localRenderer = new Renderer({ container: localContainer })
+    try {
+      await localRenderer.render(createAudioBuffer([[0, 0.5, -0.5]]))
+      roCallback?.() // schedules the 100ms resize debounce
+      localRenderer.destroy()
+      jest.advanceTimersByTime(1000)
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(resizeSpy).not.toHaveBeenCalled()
+    } finally {
+      resizeSpy.mockRestore()
+      ;(global as any).ResizeObserver = OriginalRO
+      jest.useRealTimers()
+      localContainer.remove()
+    }
+  })
+
+  it('visibleRange is truthful right after render, with no scroll event dispatched', async () => {
+    // Stub the scrollable metrics BEFORE render(), as real layout would
+    // produce them -- unlike 'recomputes visibleRange...' above, which stubs
+    // AFTER render() and dispatches a 'scroll' event. This exercises the
+    // render()-internal scrollStream.refresh() call directly: without it,
+    // scrollStream was only ever updated by a DOM 'scroll' event, so
+    // visibleRange stayed pinned to the construction-time {startX:0, endX:1}
+    // shape (full duration) until the user scrolled.
+    const scrollContainer = (renderer as any).scrollContainer as HTMLElement
+    Object.defineProperty(scrollContainer, 'scrollWidth', { configurable: true, value: 1000 })
+    Object.defineProperty(scrollContainer, 'clientWidth', { configurable: true, value: 100 })
+
+    renderer.zoom(1000) // force isScrollable (no-op before first render, see zoom())
+    const buffer = createAudioBuffer([[0, 0.5, -0.5]], 100)
+    await renderer.render(buffer)
+
+    expect((renderer as any).isScrollable.value).toBe(true)
+    const range = renderer.getVisibleRange().value
+    expect(range.endTime).toBeLessThan(100)
+    expect(range.endTime).toBeCloseTo(10) // (0 + 100) / 1000 * 100
+  })
+
+  it('zoom() updates visibleRange via the same refresh path', async () => {
+    const buffer = createAudioBuffer([[0, 0.5, -0.5]], 100)
+    renderer.zoom(1000)
+    await renderer.render(buffer)
+
+    const scrollContainer = (renderer as any).scrollContainer as HTMLElement
+    // Layout changes between renders without a 'scroll' event ever firing --
+    // zoom()'s reRender() -> render() must refresh scrollStream itself.
+    Object.defineProperty(scrollContainer, 'scrollWidth', { configurable: true, value: 2000 })
+    Object.defineProperty(scrollContainer, 'clientWidth', { configurable: true, value: 200 })
+
+    renderer.zoom(2000)
+
+    const range = renderer.getVisibleRange().value
+    expect(range.endTime).toBeCloseTo(10) // (0 + 200) / 2000 * 100
+  })
+
+  describe('dragToSeek object-form toggling', () => {
+    beforeAll(() => {
+      // Polyfill matchMedia and PointerEvent for jsdom, same shims as
+      // reactive/drag-stream.test.ts -- createDragStream() reads matchMedia
+      // synchronously to detect touch devices.
+      if (typeof window.matchMedia === 'undefined') {
+        Object.defineProperty(window, 'matchMedia', {
+          writable: true,
+          value: jest.fn().mockReturnValue({
+            matches: false,
+            addListener: jest.fn(),
+            removeListener: jest.fn(),
+          }),
+        })
+      }
+      if (typeof window.PointerEvent === 'undefined') {
+        class FakePointerEvent extends MouseEvent {
+          constructor(type: string, props: any) {
+            super(type, props)
+          }
+        }
+        // @ts-expect-error - Polyfill PointerEvent for jsdom test environment
+        window.PointerEvent = FakePointerEvent
+        // @ts-expect-error - Polyfill PointerEvent for jsdom test environment
+        global.PointerEvent = FakePointerEvent
+      }
+    })
+
+    const stubRect = (wrapper: HTMLElement) => {
+      wrapper.getBoundingClientRect = () =>
+        ({ left: 0, top: 0, right: 100, bottom: 50, width: 100, height: 50, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect
+    }
+
+    // Full pointerdown -> pointermove -> pointerup cycle (past the default
+    // threshold of 3px) so createDragStream's internal document listeners are
+    // torn down again at the end of each simulated drag, same as
+    // reactive/drag-stream.test.ts's pattern.
+    const simulateDrag = (wrapper: HTMLElement) => {
+      wrapper.dispatchEvent(new PointerEvent('pointerdown', { clientX: 0, clientY: 0, button: 0 }))
+      window.dispatchEvent(new PointerEvent('pointermove', { clientX: 20, clientY: 0 }))
+      window.dispatchEvent(new PointerEvent('pointerup', { clientX: 20, clientY: 0 }))
+    }
+
+    test('enabling dragToSeek with the object form via setOptions makes drag work', () => {
+      const wrapper = renderer.getWrapper()
+      stubRect(wrapper)
+      const dragStartSpy = jest.fn()
+      renderer.dragEventsSignal.subscribe((e) => {
+        if (e?.type === 'start') dragStartSpy(e.relativeX)
+      })
+
+      expect((renderer as any).dragStream).toBeNull()
+
+      renderer.setOptions({ ...(renderer as any).options, dragToSeek: { debounceTime: 100 } })
+
+      simulateDrag(wrapper)
+      expect(dragStartSpy).toHaveBeenCalled()
+    })
+
+    test('auto-scrolls continuously while the pointer rests in the edge zone during a drag', () => {
+      jest.useFakeTimers()
+      const wrapper = renderer.getWrapper()
+      stubRect(wrapper)
+      const scrollContainer = (renderer as any).scrollContainer as HTMLElement
+      scrollContainer.getBoundingClientRect = () =>
+        ({ left: 0, top: 0, right: 100, bottom: 50, width: 100, height: 50, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect
+      scrollContainer.scrollLeft = 500
+      renderer.setOptions({ ...(renderer as any).options, dragToSeek: true, autoScroll: true })
+
+      wrapper.dispatchEvent(new PointerEvent('pointerdown', { clientX: 50, clientY: 0, button: 0 }))
+      window.dispatchEvent(new PointerEvent('pointermove', { clientX: 60, clientY: 0 }))
+      window.dispatchEvent(new PointerEvent('pointermove', { clientX: 0, clientY: 0 }))
+      const before = scrollContainer.scrollLeft
+      jest.advanceTimersByTime(100)
+      expect(scrollContainer.scrollLeft).toBeLessThan(before)
+
+      window.dispatchEvent(new PointerEvent('pointerup', { clientX: 0, clientY: 0 }))
+      const after = scrollContainer.scrollLeft
+      jest.advanceTimersByTime(100)
+      expect(scrollContainer.scrollLeft).toBe(after)
+      jest.useRealTimers()
+    })
+
+    test('drag move events report the current pointer position', () => {
+      const wrapper = renderer.getWrapper()
+      wrapper.getBoundingClientRect = () =>
+        ({
+          left: 0,
+          top: 0,
+          right: 1000,
+          bottom: 50,
+          width: 1000,
+          height: 50,
+          x: 0,
+          y: 0,
+          toJSON: () => ({}),
+        }) as DOMRect
+      renderer.setOptions({ ...(renderer as any).options, dragToSeek: true })
+      const moves: number[] = []
+      renderer.dragEventsSignal.subscribe((e) => {
+        if (e?.type === 'move') moves.push(e.relativeX)
+      })
+
+      wrapper.dispatchEvent(new PointerEvent('pointerdown', { clientX: 100, clientY: 0, button: 0 }))
+      for (const x of [200, 400, 600]) window.dispatchEvent(new PointerEvent('pointermove', { clientX: x, clientY: 0 }))
+      window.dispatchEvent(new PointerEvent('pointerup', { clientX: 600, clientY: 0 }))
+      expect(moves).toEqual([0.2, 0.4, 0.6])
+    })
+
+    test('does not auto-scroll during a drag when autoScroll is false', () => {
+      jest.useFakeTimers()
+      const wrapper = renderer.getWrapper()
+      stubRect(wrapper)
+      const scrollContainer = (renderer as any).scrollContainer as HTMLElement
+      scrollContainer.getBoundingClientRect = () =>
+        ({ left: 0, top: 0, right: 100, bottom: 50, width: 100, height: 50, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect
+      scrollContainer.scrollLeft = 500
+      renderer.setOptions({ ...(renderer as any).options, dragToSeek: true, autoScroll: false })
+
+      wrapper.dispatchEvent(new PointerEvent('pointerdown', { clientX: 50, clientY: 0, button: 0 }))
+      window.dispatchEvent(new PointerEvent('pointermove', { clientX: 0, clientY: 0 }))
+      jest.advanceTimersByTime(100)
+      expect(scrollContainer.scrollLeft).toBe(500)
+
+      window.dispatchEvent(new PointerEvent('pointerup', { clientX: 0, clientY: 0 }))
+      jest.useRealTimers()
+    })
+
+    test('disabling dragToSeek via setOptions (object -> false) kills drag', () => {
+      const wrapper = renderer.getWrapper()
+      stubRect(wrapper)
+
+      renderer.setOptions({ ...(renderer as any).options, dragToSeek: { debounceTime: 100 } })
+      expect((renderer as any).dragStream).not.toBeNull()
+
+      const dragStartSpy = jest.fn()
+      renderer.dragEventsSignal.subscribe((e) => {
+        if (e?.type === 'start') dragStartSpy(e.relativeX)
+      })
+
+      renderer.setOptions({ ...(renderer as any).options, dragToSeek: false })
+      expect((renderer as any).dragStream).toBeNull()
+
+      simulateDrag(wrapper)
+      expect(dragStartSpy).not.toHaveBeenCalled()
+    })
+
+    test('repeated setOptions toggles do not accumulate disposers on this.scope', () => {
+      const scope = (renderer as any).scope as { disposers: unknown[] }
+      const baseline = scope.disposers.length
+
+      for (let i = 0; i < 5; i++) {
+        renderer.setOptions({ ...(renderer as any).options, dragToSeek: { debounceTime: 100 } })
+        renderer.setOptions({ ...(renderer as any).options, dragToSeek: false })
+      }
+
+      expect(scope.disposers.length).toBe(baseline)
+      expect((renderer as any).dragScope).toBeNull()
+    })
+
+    test('repeated setOptions toggles balance pointerdown listener add/remove on the wrapper', () => {
+      const wrapper = renderer.getWrapper()
+      const addSpy = jest.spyOn(wrapper, 'addEventListener')
+      const removeSpy = jest.spyOn(wrapper, 'removeEventListener')
+
+      for (let i = 0; i < 5; i++) {
+        renderer.setOptions({ ...(renderer as any).options, dragToSeek: { debounceTime: 100 } })
+        renderer.setOptions({ ...(renderer as any).options, dragToSeek: false })
+      }
+
+      const adds = addSpy.mock.calls.filter(([type]) => type === 'pointerdown').length
+      const removes = removeSpy.mock.calls.filter(([type]) => type === 'pointerdown').length
+      expect(adds).toBe(5)
+      expect(removes).toBe(5)
+
+      addSpy.mockRestore()
+      removeSpy.mockRestore()
+    })
+  })
+})

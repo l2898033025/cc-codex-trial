@@ -1,0 +1,43 @@
+/**
+ * The Template plugin
+ */
+
+import { type BasePluginEvents } from '../base-plugin.js'
+import { definePlugin } from '../define-plugin.js'
+
+export type TemplatePluginOptions = {
+  // Add plugin options here
+}
+
+const defaultOptions = {
+  // Add default option values here
+}
+
+export type TemplatePluginEvents = BasePluginEvents & {
+  // Add public events here, e.g.: 'some-event': [payload: string]
+}
+
+/** The plugin's public API, returned from the setup function below */
+export type TemplatePluginApi = {
+  // Add public methods here
+}
+
+const TemplatePlugin = definePlugin<TemplatePluginOptions, TemplatePluginEvents, TemplatePluginApi>(
+  'TemplatePlugin',
+  (ctx, options) => {
+    const opts: TemplatePluginOptions & typeof defaultOptions = Object.assign({}, defaultOptions, options)
+    void opts
+
+    // ctx.wavesurfer — the WaveSurfer instance
+    // ctx.state — reactive state signals (wavesurfer.getState())
+    // ctx.scope — register all listeners/timers/DOM here; disposed on destroy,
+    //   e.g. ctx.scope.listen(el, 'click', handler) or ctx.scope.add(() => el.remove())
+    // ctx.emit — emit the plugin's public events
+
+    return {
+      // Public API methods
+    }
+  },
+)
+
+export default TemplatePlugin

@@ -1,0 +1,143 @@
+import { FrameScheduler } from '../frame-scheduler.js'
+import { Scope } from '../scope.js'
+
+describe('FrameScheduler', () => {
+  beforeEach(() => {
+    let id = 0
+    const pending = new Map<number, FrameRequestCallback>()
+    ;(global as any).requestAnimationFrame = (cb: FrameRequestCallback) => {
+      pending.set(++id, cb)
+      return id
+    }
+    ;(global as any).cancelAnimationFrame = (i: number) => pending.delete(i)
+    ;(global as any).__flushFrames = (n = 1) => {
+      for (let k = 0; k < n; k++) {
+        const cbs = [...pending.values()]
+        pending.clear()
+        cbs.forEach((cb) => cb(performance.now()))
+      }
+    }
+  })
+
+  // Note: start() fires the first tick synchronously (replicating Timer.start()'s
+  // behavior) so WaveSurfer's compatibility contract for the first timeupdate/
+  // audioprocess emission is preserved. That adds one extra synchronous call on
+  // top of the RAF-scheduled calls, versus a scheduler whose first tick is
+  // itself RAF-scheduled.
+  it('ticks the callback once per frame while running, plus a synchronous first tick', () => {
+    const scope = new Scope()
+    const scheduler = new FrameScheduler(scope)
+    const tick = jest.fn()
+    scheduler.start(tick)
+    expect(tick).toHaveBeenCalledTimes(1) // synchronous first tick from start()
+    ;(global as any).__flushFrames(3)
+    expect(tick).toHaveBeenCalledTimes(4)
+    scheduler.stop()
+    ;(global as any).__flushFrames(2)
+    expect(tick).toHaveBeenCalledTimes(4)
+  })
+
+  it('start is idempotent (no double loops)', () => {
+    const scope = new Scope()
+    const scheduler = new FrameScheduler(scope)
+    const tick = jest.fn()
+    scheduler.start(tick)
+    scheduler.start(tick)
+    expect(tick).toHaveBeenCalledTimes(1) // only the first start() fires synchronously
+    ;(global as any).__flushFrames(1)
+    expect(tick).toHaveBeenCalledTimes(2)
+  })
+
+  it('scope disposal stops the loop', () => {
+    const scope = new Scope()
+    const scheduler = new FrameScheduler(scope)
+    const tick = jest.fn()
+    scheduler.start(tick)
+    expect(tick).toHaveBeenCalledTimes(1) // synchronous first tick already fired
+    scope.dispose()
+    ;(global as any).__flushFrames(2)
+    expect(tick).toHaveBeenCalledTimes(1) // no further ticks after dispose
+  })
+
+  it('running reflects start/stop state', () => {
+    const scope = new Scope()
+    const scheduler = new FrameScheduler(scope)
+    expect(scheduler.running).toBe(false)
+    scheduler.start(jest.fn())
+    expect(scheduler.running).toBe(true)
+    scheduler.stop()
+    expect(scheduler.running).toBe(false)
+  })
+
+  it('stop is idempotent', () => {
+    const scope = new Scope()
+    const scheduler = new FrameScheduler(scope)
+    scheduler.start(jest.fn())
+    scheduler.stop()
+    expect(() => scheduler.stop()).not.toThrow()
+  })
+
+  it('a throwing callback does not kill the loop: the next frame is scheduled before the callback runs', () => {
+    const scope = new Scope()
+    const scheduler = new FrameScheduler(scope)
+    let calls = 0
+    const tick = jest.fn(() => {
+      calls++
+      if (calls === 2) throw new Error('subscriber boom')
+    })
+
+    scheduler.start(tick) // synchronous first tick: calls = 1
+
+    // The second tick throws. The error must still surface (not be swallowed)...
+    expect(() => (global as any).__flushFrames(1)).toThrow('subscriber boom')
+    expect(calls).toBe(2)
+
+    // ...but the loop must survive: the next frame was scheduled before the
+    // callback ran, so ticking continues and the scheduler is still running.
+    ;(global as any).__flushFrames(2)
+    expect(calls).toBe(4)
+    expect(scheduler.running).toBe(true)
+
+    scheduler.stop()
+    ;(global as any).__flushFrames(1)
+    expect(calls).toBe(4)
+  })
+
+  it('stop() called from inside the callback cancels the frame scheduled for that tick', () => {
+    const scope = new Scope()
+    const scheduler = new FrameScheduler(scope)
+    const tick = jest.fn(() => scheduler.stop())
+
+    scheduler.start(tick) // synchronous first tick calls stop()
+    expect(scheduler.running).toBe(false)
+    ;(global as any).__flushFrames(2)
+    expect(tick).toHaveBeenCalledTimes(1)
+  })
+
+  it('restarts cleanly after stop: a fresh synchronous first tick, then RAF ticks resume', () => {
+    const scope = new Scope()
+    const scheduler = new FrameScheduler(scope)
+    const tick = jest.fn()
+
+    scheduler.start(tick)
+    expect(tick).toHaveBeenCalledTimes(1) // synchronous first tick
+    ;(global as any).__flushFrames(2)
+    expect(tick).toHaveBeenCalledTimes(3)
+
+    scheduler.stop()
+    ;(global as any).__flushFrames(2) // stopped: no further ticks, and the cancelled frame is gone
+    expect(tick).toHaveBeenCalledTimes(3)
+    expect(scheduler.running).toBe(false)
+
+    // Restart: start() fires its synchronous first tick again (same as a fresh scheduler would),
+    // and the RAF loop resumes ticking on subsequent frames - stop() must not have left any stale
+    // frameId/isRunning state that would make this a no-op or double-schedule.
+    scheduler.start(tick)
+    expect(scheduler.running).toBe(true)
+    expect(tick).toHaveBeenCalledTimes(4)
+    ;(global as any).__flushFrames(2)
+    expect(tick).toHaveBeenCalledTimes(6)
+
+    scheduler.stop()
+  })
+})

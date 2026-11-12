@@ -1,0 +1,400 @@
+/**
+ * The Timeline plugin adds timestamps and notches under the waveform.
+ */
+
+import { type BasePluginEvents } from '../base-plugin.js'
+import { definePlugin } from '../define-plugin.js'
+import { resolveContainer } from '../plugin-utils.js'
+import createElement from '../dom.js'
+import { effect } from '../reactive/store.js'
+
+export type TimelinePluginOptions = {
+  /** The height of the timeline in pixels, defaults to 20 */
+  height?: number
+  /** HTML element or selector for a timeline container, defaults to wavesufer's container */
+  container?: HTMLElement | string
+  /**
+   * Pass 'beforebegin' to insert the timeline on top of the waveform. In the default container it gets its own
+   * space above the waveform (the player grows by `height`). With a custom `container`, no space is reserved;
+   * absolute positioning remains relative to the nearest positioned ancestor.
+   */
+  insertPosition?: InsertPosition
+  /** The duration of the timeline in seconds, defaults to wavesurfer's duration */
+  duration?: number
+  /** Interval between ticks in seconds */
+  timeInterval?: number
+  /** Interval between numeric labels in seconds */
+  primaryLabelInterval?: number
+  /** Interval between secondary numeric labels in seconds */
+  secondaryLabelInterval?: number
+  /** Interval between numeric labels in timeIntervals (i.e notch count) */
+  primaryLabelSpacing?: number
+  /** Interval between secondary numeric labels  in timeIntervals (i.e notch count) */
+  secondaryLabelSpacing?: number
+  /** offset in seconds for the numeric labels */
+  timeOffset?: number
+  /** Custom inline style to apply to the container */
+  style?: Partial<CSSStyleDeclaration> | string
+  /** Turn the time into a suitable label for the time. */
+  formatTimeCallback?: (seconds: number) => string
+  /** Opacity of the secondary labels, defaults to 0.25 */
+  secondaryLabelOpacity?: number
+}
+
+const defaultOptions = {
+  height: 20,
+  timeOffset: 0,
+  formatTimeCallback: (seconds: number) => {
+    if (seconds / 60 > 1) {
+      // calculate minutes and seconds from seconds count
+      const minutes = Math.floor(seconds / 60)
+      seconds = Math.round(seconds % 60)
+      const paddedSeconds = `${seconds < 10 ? '0' : ''}${seconds}`
+      return `${minutes}:${paddedSeconds}`
+    }
+    const rounded = Math.round(seconds * 1000) / 1000
+    return `${rounded}`
+  },
+}
+
+export type TimelinePluginEvents = BasePluginEvents & {
+  ready: []
+}
+
+// Top timelines sharing one scroll container reserve space above the waveform together. The stack
+// remembers the container's own padding (a stylesheet may set it, e.g. through ::part(scroll)) and
+// its inline declaration, so that spacing is kept while any timeline is active and the original
+// declaration is put back when the last one goes. Every add or remove re-lays out all the entries,
+// so destroying timelines in any order keeps the remaining ones sitting right above the waveform.
+type TopReservation = { height: number; place: (offset: number) => void }
+type TopStack = { basePadding: number; inlineValue: string; inlinePriority: string; entries: TopReservation[] }
+const topStacks = new WeakMap<HTMLElement, TopStack>()
+
+function restoreInlinePadding(scrollContainer: HTMLElement, stack: TopStack) {
+  if (stack.inlineValue) scrollContainer.style.setProperty('padding-top', stack.inlineValue, stack.inlinePriority)
+  else scrollContainer.style.removeProperty('padding-top')
+}
+
+// The page's own padding, as it is right now. Our reservation hides it (it is important), so put the
+// original inline declaration back first; the caller lays the stack out again straight afterwards.
+function measureBasePadding(scrollContainer: HTMLElement, stack: TopStack): number {
+  restoreInlinePadding(scrollContainer, stack)
+  return parseFloat(getComputedStyle(scrollContainer).paddingTop) || 0
+}
+
+function layoutTopStack(scrollContainer: HTMLElement, stack: TopStack) {
+  let offset = 0
+  for (const entry of stack.entries) {
+    offset += entry.height
+    entry.place(offset)
+  }
+  // `important`: a page rule on the container (e.g. `::part(scroll) { padding-top }`) comes from an
+  // outer tree context and beats a normal inline declaration, which would leave the timeline
+  // clipped above the container. Its value is already part of basePadding, so it isn't lost.
+  scrollContainer.style.setProperty('padding-top', `${stack.basePadding + offset}px`, 'important')
+}
+
+/**
+ * Reserves `height` px above the waveform. Returns a function that gives it back and one that
+ * re-reads the page's padding (it can change with the viewport, e.g. in a media query) and re-lays
+ * out, since the reservation freezes whatever padding was there when it was made.
+ */
+function reserveTopSpace(scrollContainer: HTMLElement, height: number, place: (offset: number) => void) {
+  let stack = topStacks.get(scrollContainer)
+  if (!stack) {
+    stack = {
+      basePadding: parseFloat(getComputedStyle(scrollContainer).paddingTop) || 0,
+      inlineValue: scrollContainer.style.getPropertyValue('padding-top'),
+      inlinePriority: scrollContainer.style.getPropertyPriority('padding-top'),
+      entries: [],
+    }
+    topStacks.set(scrollContainer, stack)
+  }
+  const entry: TopReservation = { height, place }
+  stack.entries.push(entry)
+  layoutTopStack(scrollContainer, stack)
+
+  const release = () => {
+    const index = stack.entries.indexOf(entry)
+    if (index === -1) return
+    stack.entries.splice(index, 1)
+    if (stack.entries.length) {
+      layoutTopStack(scrollContainer, stack)
+      return
+    }
+    topStacks.delete(scrollContainer)
+    restoreInlinePadding(scrollContainer, stack)
+  }
+
+  const refresh = () => {
+    // Every top timeline registers this for the same events but they share one stack, so only the
+    // first live entry does the work. When it is released the next one becomes the first, and takes over.
+    if (stack.entries[0] !== entry) return
+    const base = measureBasePadding(scrollContainer, stack)
+    // Re-lay out either way: measuring put the original inline declaration back
+    stack.basePadding = base
+    layoutTopStack(scrollContainer, stack)
+  }
+
+  return { release, refresh }
+}
+
+type PendingNotch = { start: number; element: HTMLElement }
+
+const TimelinePlugin = definePlugin<TimelinePluginOptions, TimelinePluginEvents, object>(
+  'TimelinePlugin',
+  (ctx, options) => {
+    const opts: TimelinePluginOptions & typeof defaultOptions = Object.assign({}, defaultOptions, options)
+
+    const timelineWrapper = createElement('div', { part: 'timeline-wrapper', style: { pointerEvents: 'none' } })
+    // How far above the waveform a top timeline sits (px): its own height plus that of the top
+    // timelines registered before it. Kept up to date by reserveTopSpace().
+    let reservedTop = 0
+
+    // Notch metadata for batch visibility updates, and the currently rendered
+    // timeline element (rebuilt on every initTimeline() call).
+    const notchElements: Map<HTMLElement, { start: number; width: number; wasVisible: boolean }> = new Map()
+    let currentTimeline: HTMLElement | undefined = undefined
+
+    // Return how many seconds should be between each notch
+    function defaultTimeInterval(pxPerSec: number): number {
+      if (pxPerSec >= 25) {
+        return 1
+      } else if (pxPerSec * 5 >= 25) {
+        return 5
+      } else if (pxPerSec * 15 >= 25) {
+        return 15
+      }
+      return Math.ceil(0.5 / pxPerSec) * 60
+    }
+
+    // Return the cadence of notches that get labels in the primary color.
+    function defaultPrimaryLabelInterval(pxPerSec: number): number {
+      if (pxPerSec >= 25) {
+        return 10
+      } else if (pxPerSec * 5 >= 25) {
+        return 6
+      } else if (pxPerSec * 15 >= 25) {
+        return 4
+      }
+      return 4
+    }
+
+    // Return the cadence of notches that get labels in the secondary color.
+    function defaultSecondaryLabelInterval(pxPerSec: number): number {
+      if (pxPerSec >= 25) {
+        return 5
+      } else if (pxPerSec * 5 >= 25) {
+        return 2
+      } else if (pxPerSec * 15 >= 25) {
+        return 2
+      }
+      return 2
+    }
+
+    // Append all notches first, then measure them in one pass (a single layout),
+    // then remove the ones outside the visible window.
+    function virtualAppend(start: number, container: HTMLElement, element: HTMLElement, pending: PendingNotch[]) {
+      container.appendChild(element)
+      pending.push({ start, element })
+    }
+
+    function flushNotches(pending: PendingNotch[]) {
+      const scrollLeft = ctx.wavesurfer.getScroll()
+      const scrollRight = scrollLeft + ctx.wavesurfer.getWidth()
+      const widths = pending.map(({ element }) => element.clientWidth)
+
+      pending.forEach(({ start, element }, i) => {
+        const width = widths[i]
+        const isVisible = start >= scrollLeft && start + width < scrollRight
+        notchElements.set(element, { start, width, wasVisible: isVisible })
+        if (!isVisible) element.remove()
+      })
+    }
+
+    function updateVisibleNotches(scrollLeft: number, scrollRight: number, container: HTMLElement) {
+      notchElements.forEach((notchData, element) => {
+        const isVisible = notchData.start >= scrollLeft && notchData.start + notchData.width < scrollRight
+
+        if (isVisible === notchData.wasVisible) return
+        notchData.wasVisible = isVisible
+
+        if (isVisible) {
+          container.appendChild(element)
+        } else {
+          element.remove()
+        }
+      })
+    }
+
+    function initTimeline() {
+      notchElements.clear()
+
+      // getDuration() returns a number (0 when nothing is loaded), never
+      // nullish -- `??` would make opts.duration dead code, and the timeline
+      // could never render before audio loads despite the option existing
+      // for exactly that.
+      const duration = ctx.wavesurfer.getDuration() || opts.duration || 0
+      const pxPerSec = (ctx.wavesurfer.getWrapper().scrollWidth || timelineWrapper.scrollWidth) / duration
+      const timeInterval = opts.timeInterval ?? defaultTimeInterval(pxPerSec)
+      const primaryLabelInterval = opts.primaryLabelInterval ?? defaultPrimaryLabelInterval(pxPerSec)
+      const primaryLabelSpacing = opts.primaryLabelSpacing
+      const secondaryLabelInterval = opts.secondaryLabelInterval ?? defaultSecondaryLabelInterval(pxPerSec)
+      const secondaryLabelSpacing = opts.secondaryLabelSpacing
+      const isTop = opts.insertPosition === 'beforebegin'
+
+      const timeline = createElement('div', {
+        style: {
+          height: `${opts.height}px`,
+          overflow: 'hidden',
+          fontSize: `${opts.height / 2}px`,
+          whiteSpace: 'nowrap',
+          ...(isTop
+            ? {
+                position: 'absolute',
+                top: `${-reservedTop}px`,
+                left: '0',
+                right: '0',
+                zIndex: '2',
+              }
+            : {
+                position: 'relative',
+              }),
+        },
+      })
+
+      timeline.setAttribute('part', 'timeline')
+
+      if (typeof opts.style === 'string') {
+        timeline.setAttribute('style', timeline.getAttribute('style') + opts.style)
+      } else if (typeof opts.style === 'object') {
+        Object.assign(timeline.style, opts.style)
+      }
+
+      // Attach the (empty) timeline to the document BEFORE building notches so
+      // virtualAppend can measure each notch's real width after insertion.
+      timelineWrapper.innerHTML = ''
+      timelineWrapper.appendChild(timeline)
+      currentTimeline = timeline
+
+      const notchEl = createElement('div', {
+        style: {
+          width: '0',
+          height: '50%',
+          display: 'flex',
+          flexDirection: 'column',
+          justifyContent: isTop ? 'flex-start' : 'flex-end',
+          top: isTop ? '0' : 'auto',
+          bottom: isTop ? 'auto' : '0',
+          overflow: 'visible',
+          borderLeft: '1px solid currentColor',
+          opacity: `${opts.secondaryLabelOpacity ?? 0.25}`,
+          position: 'absolute',
+          zIndex: '1',
+        },
+      })
+
+      const pending: PendingNotch[] = []
+      for (let i = 0, notches = 0; i < duration; i += timeInterval, notches++) {
+        const notch = notchEl.cloneNode() as HTMLElement
+        const isPrimary =
+          Math.round(i * 100) % Math.round(primaryLabelInterval * 100) === 0 ||
+          (primaryLabelSpacing && notches % primaryLabelSpacing === 0)
+        const isSecondary =
+          Math.round(i * 100) % Math.round(secondaryLabelInterval * 100) === 0 ||
+          (secondaryLabelSpacing && notches % secondaryLabelSpacing === 0)
+
+        if (isPrimary || isSecondary) {
+          notch.style.height = '100%'
+          notch.style.textIndent = '3px'
+          notch.textContent = opts.formatTimeCallback(i)
+          if (isPrimary) notch.style.opacity = '1'
+        }
+
+        const mode = isPrimary ? 'primary' : isSecondary ? 'secondary' : 'tick'
+        notch.setAttribute('part', `timeline-notch timeline-notch-${mode}`)
+
+        const offset = (i + opts.timeOffset) * pxPerSec
+        notch.style.left = `${offset}px`
+        virtualAppend(offset, timeline, notch, pending)
+      }
+      flushNotches(pending)
+
+      ctx.emit('ready')
+    }
+
+    const container = resolveContainer(opts.container, ctx.wavesurfer.getWrapper(), 'timeline')
+
+    if (opts.insertPosition) {
+      ;(container.firstElementChild || container).insertAdjacentElement(opts.insertPosition, timelineWrapper)
+    } else {
+      container.appendChild(timelineWrapper)
+    }
+    ctx.scope.add(() => timelineWrapper.remove())
+
+    // A top timeline inside the waveform gets its own space above it, like a bottom one does,
+    // instead of being drawn over the waveform's top edge where high peaks run under the labels
+    // (#3551). The space is padding on the scroll container, so the waveform, progress and cursor
+    // move down together; the timeline sits in it at a negative top and still scrolls with them.
+    // Each top timeline stacks above the ones registered before it.
+    const scrollContainer = ctx.wavesurfer.getWrapper().parentElement
+    if (opts.insertPosition === 'beforebegin' && container === ctx.wavesurfer.getWrapper() && scrollContainer) {
+      const { release, refresh } = reserveTopSpace(scrollContainer, opts.height, (offset) => {
+        reservedTop = offset
+        if (currentTimeline) currentTimeline.style.top = `${-offset}px`
+      })
+      ctx.scope.add(release)
+      // The page's own padding can change with the viewport (a media query), but the reservation
+      // overrides it, so re-read it when the waveform re-renders or the window is resized.
+      ctx.scope.add(ctx.wavesurfer.on('redraw', refresh))
+      ctx.scope.listen(window, 'resize', refresh)
+    }
+
+    // Get reactive state
+    const { duration } = ctx.state
+
+    // React to duration changes and redraw events to initialize timeline. A
+    // subscription, not an effect: an effect would also run now, and the
+    // initial build is done once, at the end of setup
+    ctx.scope.add(
+      duration.subscribe((dur) => {
+        if (dur > 0 || opts.duration) {
+          initTimeline()
+        }
+      }),
+    )
+
+    ctx.scope.add(ctx.wavesurfer.on('redraw', () => initTimeline()))
+
+    // Re-window notches off the renderer's visibleRange (derived from scroll
+    // position + duration) rather than hand-rolling scroll math off the raw
+    // 'scroll' event. Registered once, not on every redraw.
+    const renderer = ctx.wavesurfer.getRenderer()
+    ctx.scope.add(
+      effect(() => {
+        if (currentTimeline) {
+          const scrollLeft = ctx.wavesurfer.getScroll()
+          // getWidth() is the container width minus its inline padding (see
+          // Renderer.getWidth()), matching virtualAppend()'s initial-visibility
+          // check below. This is intentional: it keeps the scroll-driven
+          // re-window consistent with the initial-render window, both derived
+          // from the same padding-adjusted width. The legacy 'scroll' event
+          // this replaced reported unpadded bounds (scrollLeft + clientWidth),
+          // which was inconsistent with virtualAppend -- with non-zero
+          // container padding the visible window now differs slightly (by the
+          // padding amount) from that old, inconsistent behavior.
+          const scrollRight = scrollLeft + ctx.wavesurfer.getWidth()
+          updateVisibleNotches(scrollLeft, scrollRight, currentTimeline)
+        }
+      }, [renderer.getVisibleRange()]),
+    )
+
+    if (ctx.wavesurfer.getDuration() || opts.duration) {
+      initTimeline()
+    }
+
+    return {}
+  },
+)
+
+export default TimelinePlugin

@@ -1,0 +1,1390 @@
+/**
+ * Regions are visual overlays on the waveform that can be used to mark segments of audio.
+ * Regions can be clicked on, dragged and resized.
+ * You can set the color and content of each region, as well as their HTML content.
+ */
+
+import { type BasePluginEvents } from '../base-plugin.js'
+import { definePlugin } from '../define-plugin.js'
+import EventEmitter from '../event-emitter.js'
+import createElement from '../dom.js'
+import { computeLabelMargins } from '../label-stacking.js'
+import { Scope } from '../scope.js'
+import { createDragStream } from '../reactive/drag-stream.js'
+import { effect } from '../reactive/store.js'
+import { fromEvent, cleanup as cleanupStream } from '../reactive/event-streams.js'
+import type WaveSurfer from '../wavesurfer.js'
+
+// The pre-port class took no options at all (`constructor(options?: undefined)`).
+// Kept as `undefined` here (the public alias) rather than widened, since
+// consumers may reference this exported type. A bare `undefined` Options type
+// does not fit definePlugin's PluginCtorArgs contract on its own
+// (`Record<string, never> extends Options ? [options?: Options] : ...`):
+// `Record<string, never> extends undefined` is false, which would make the
+// generated `create()`/constructor take a REQUIRED `undefined` argument and
+// break every existing zero-arg `RegionsPlugin.create()` call site. Instead
+// the `definePlugin(...)` call below widens ONLY its own Options type
+// parameter to `RegionsPluginOptions | Record<string, never>` — a union that
+// still contains `Record<string, never>` as a member, so
+// `Record<string, never> extends Options` is true and `create()` /
+// `create(undefined)` / `create({})` all stay callable — without changing
+// the public `RegionsPluginOptions` alias itself.
+export type RegionsPluginOptions = undefined
+export type UpdateSide = 'start' | 'end'
+export type RegionsPluginEvents = BasePluginEvents & {
+  /** When a new region is initialized but not rendered yet */
+  'region-initialized': [region: Region]
+  /** When a region is created */
+  'region-created': [region: Region]
+  /** When a region is being updated */
+  'region-update': [region: Region, side?: UpdateSide]
+  /** When a region is done updating */
+  'region-updated': [region: Region, side?: UpdateSide]
+  /** When a region is removed */
+  'region-removed': [region: Region]
+  /** When a region is clicked */
+  'region-clicked': [region: Region, e: MouseEvent]
+  /** When a region is double-clicked */
+  'region-double-clicked': [region: Region, e: MouseEvent]
+  /** When playback enters a region */
+  'region-in': [region: Region]
+  /** When playback leaves a region */
+  'region-out': [region: Region]
+  /** When region content is changed */
+  'region-content-changed': [region: Region]
+}
+
+/** Which direction may be auto-scrolled when a region update overflows the scroll container */
+export type AutoScrollDirection = 'left' | 'right' | 'both' | 'none'
+
+export type RegionEvents = {
+  /** Before the region is removed */
+  remove: []
+  /** When the region's parameters are being updated */
+  update: [side?: UpdateSide, autoScrollDirection?: AutoScrollDirection]
+  /** When dragging or resizing is finished */
+  'update-end': [side?: UpdateSide]
+  /** When the region needs to be re-rendered */
+  render: []
+  /** On play */
+  play: [end?: number]
+  /** On mouse click */
+  click: [event: MouseEvent]
+  /** Double click */
+  dblclick: [event: MouseEvent]
+  /** Mouse over */
+  over: [event: MouseEvent]
+  /** Mouse leave */
+  leave: [event: MouseEvent]
+  /** content changed */
+  'content-changed': []
+}
+
+export type RegionParams = {
+  /** The id of the region, any string */
+  id?: string
+  /** The start position of the region (in seconds) */
+  start: number
+  /** The end position of the region (in seconds) */
+  end?: number
+  /** Allow/dissallow dragging the region */
+  drag?: boolean
+  /** Allow/dissallow resizing the region */
+  resize?: boolean
+  /** Allow/dissallow resizing the start of the region */
+  resizeStart?: boolean
+  /** Allow/dissallow resizing the end of the region */
+  resizeEnd?: boolean
+  /** The color of the region (CSS color) */
+  color?: string
+  /** Content string or HTML element */
+  content?: string | HTMLElement
+  /** Min length when resizing (in seconds) */
+  minLength?: number
+  /** Max length when resizing (in seconds) */
+  maxLength?: number
+  /** The index of the channel */
+  channelIdx?: number
+  /** Allow/Disallow contenteditable property for content */
+  contentEditable?: boolean
+  /**
+   * Move the content down when it overlaps the content of an earlier region (default: true).
+   * Set to false for content you position yourself: it is not moved, it is ignored when placing
+   * other regions' content, and turning it off with setOptions clears its margin-top.
+   * Turning it back on places the labels again straight away (the region emits `render`).
+   */
+  avoidOverlapping?: boolean
+}
+
+/** How far each side of a region's element sticks out of the scroll container, in pixels */
+function getRegionSideOverflow(
+  element: HTMLElement | null,
+  scrollContainer: HTMLElement | null | undefined,
+): { overflowLeft: number; overflowRight: number } | undefined {
+  if (!element || !scrollContainer) return
+
+  const { clientWidth, scrollWidth } = scrollContainer
+  if (scrollWidth <= clientWidth) return
+
+  const scrollBbox = scrollContainer.getBoundingClientRect()
+  const bbox = element.getBoundingClientRect()
+  const left = bbox.left - scrollBbox.left
+  const right = bbox.right - scrollBbox.left
+
+  const boxOverflowsLeft = left < 0
+  const boxOverflowsRight = right > clientWidth
+
+  if (boxOverflowsLeft && boxOverflowsRight) {
+    return { overflowLeft: -left, overflowRight: right - clientWidth }
+  } else if (boxOverflowsRight) {
+    return { overflowLeft: 0, overflowRight: right - clientWidth }
+  } else if (boxOverflowsLeft) {
+    return { overflowLeft: -left, overflowRight: 0 }
+  }
+  return { overflowLeft: 0, overflowRight: 0 }
+}
+
+// Mutable holder shared between a gesture's pointer-move handler and its
+// 'scroll' handler, so each scroll delta is counted exactly once by whichever
+// of the two observes it first.
+type ScrollState = {
+  scrollLeft: number
+}
+
+/** Wrap a wavesurfer 'scroll' listener that reports the scroll delta since the last call */
+function createScrollHandler(scrollState: ScrollState, callback: (scrollDiff: number) => void) {
+  return (_start: number, _end: number, scrollLeft: number) => {
+    const scrollDiff = scrollLeft - scrollState.scrollLeft
+    scrollState.scrollLeft = scrollLeft
+    callback(scrollDiff)
+  }
+}
+
+class SingleRegion extends EventEmitter<RegionEvents> implements Region {
+  public element: HTMLElement | null = null // Element is created on init
+  public id: string
+  public start: number
+  public end: number
+  public drag: boolean
+  public resize: boolean
+  public resizeStart: boolean
+  public resizeEnd: boolean
+  public color: string
+  public content?: HTMLElement
+  public minLength = 0
+  public maxLength = Infinity
+  public channelIdx: number
+  public contentEditable = false
+  public avoidOverlapping = true
+  public updatingSide?: UpdateSide = undefined
+  public isRemoved = false
+  /** True while the region body is being dragged; guards virtualization from detaching it mid-drag */
+  public isDragging = false
+  private autoScrollDirection: AutoScrollDirection = 'none'
+  private resizeHandleCleanup: (() => void) | null = null
+  private contentListenersCleanup: (() => void) | null = null
+  /** True once initMouseEvents has run; controls whether setContent must (re)attach listeners itself */
+  private mouseEventsInitialized = false
+
+  constructor(
+    params: RegionParams,
+    private totalDuration: number,
+    /**
+     * A scope private to this region, owned by RegionsPlugin (`ctx.scope.child()`).
+     * All of this region's own listener bookkeeping (mouse events, drag/resize
+     * streams, content listeners) lives here instead of a hand-rolled
+     * `subscriptions` array; `remove()` disposes it in one shot.
+     */
+    private scope: Scope,
+    private numberOfChannels = 0,
+    /**
+     * The wavesurfer instance this region is rendered into, used to follow and
+     * drive the container's horizontal scroll while dragging or resizing.
+     * Null for inert regions created after the plugin was destroyed.
+     */
+    private wavesurfer: WaveSurfer | null = null,
+  ) {
+    super()
+
+    this.id = params.id || `region-${Math.random().toString(32).slice(2)}`
+    this.start = this.clampPosition(params.start)
+    this.end = this.clampPosition(params.end ?? params.start)
+    this.drag = params.drag ?? true
+    this.resize = params.resize ?? true
+    this.resizeStart = params.resizeStart ?? true
+    this.resizeEnd = params.resizeEnd ?? true
+    this.color = params.color ?? 'rgba(0, 0, 0, 0.1)'
+    this.minLength = params.minLength ?? this.minLength
+    this.maxLength = params.maxLength ?? this.maxLength
+    this.channelIdx = params.channelIdx ?? -1
+    this.contentEditable = params.contentEditable ?? this.contentEditable
+    this.avoidOverlapping = params.avoidOverlapping ?? this.avoidOverlapping
+    this.element = this.initElement()
+    this.setContent(params.content)
+    this.setPart()
+
+    this.renderPosition()
+    this.initMouseEvents()
+  }
+
+  private clampPosition(time: number): number {
+    return Math.max(0, Math.min(this.totalDuration, time))
+  }
+
+  private setPart() {
+    const isMarker = this.start === this.end
+    this.element?.setAttribute('part', `${isMarker ? 'marker' : 'region'} ${this.id}`)
+  }
+
+  private addResizeHandles(element: HTMLElement) {
+    const handleStyle = {
+      position: 'absolute',
+      zIndex: '2',
+      width: '6px',
+      height: '100%',
+      top: '0',
+      cursor: 'ew-resize',
+      wordBreak: 'keep-all',
+    }
+
+    const leftHandle = createElement(
+      'div',
+      {
+        part: 'region-handle region-handle-left',
+        style: {
+          ...handleStyle,
+          left: '0',
+          borderLeft: '2px solid rgba(0, 0, 0, 0.5)',
+          borderRadius: '2px 0 0 2px',
+        },
+      },
+      element,
+    )
+
+    const rightHandle = createElement(
+      'div',
+      {
+        part: 'region-handle region-handle-right',
+        style: {
+          ...handleStyle,
+          right: '0',
+          borderRight: '2px solid rgba(0, 0, 0, 0.5)',
+          borderRadius: '0 2px 2px 0',
+        },
+      },
+      element,
+    )
+
+    // Resize
+    const resizeThreshold = 1
+    const leftDragStream = createDragStream(leftHandle, { threshold: resizeThreshold })
+    const rightDragStream = createDragStream(rightHandle, { threshold: resizeThreshold })
+
+    // While a handle is being dragged, container scroll (from adjustScroll's
+    // auto-scrolling, or any other source) keeps resizing the region: each
+    // scroll delta is replayed as a resize delta, which re-triggers the
+    // 'update' -> adjustScroll loop until the handle leaves the edge.
+    const scrollState: ScrollState = { scrollLeft: 0 }
+    const leftScrollHandler = createScrollHandler(scrollState, (scrollDiff) => this.onResize(scrollDiff, 'start'))
+    const rightScrollHandler = createScrollHandler(scrollState, (scrollDiff) => this.onResize(scrollDiff, 'end'))
+    let unsubscribeLeftScroll: (() => void) | null = null
+    let unsubscribeRightScroll: (() => void) | null = null
+
+    const removeLeftEffect = this.scope.add(
+      effect(() => {
+        const drag = leftDragStream.signal.value
+        if (!drag) return
+        if (drag.type === 'start') {
+          scrollState.scrollLeft = this.wavesurfer?.getScroll() ?? 0
+          if (this.wavesurfer) {
+            unsubscribeLeftScroll = this.scope.add(this.wavesurfer.on('scroll', leftScrollHandler))
+          }
+        } else if (drag.type === 'move' && drag.deltaX !== undefined) {
+          this.onResize(drag.deltaX, 'start')
+        } else if (drag.type === 'end') {
+          unsubscribeLeftScroll?.()
+          unsubscribeLeftScroll = null
+          this.onEndResizing('start')
+        }
+      }, [leftDragStream.signal]),
+    )
+
+    const removeRightEffect = this.scope.add(
+      effect(() => {
+        const drag = rightDragStream.signal.value
+        if (!drag) return
+        if (drag.type === 'start') {
+          scrollState.scrollLeft = this.wavesurfer?.getScroll() ?? 0
+          if (this.wavesurfer) {
+            unsubscribeRightScroll = this.scope.add(this.wavesurfer.on('scroll', rightScrollHandler))
+          }
+        } else if (drag.type === 'move' && drag.deltaX !== undefined) {
+          this.onResize(drag.deltaX, 'end')
+        } else if (drag.type === 'end') {
+          unsubscribeRightScroll?.()
+          unsubscribeRightScroll = null
+          this.onEndResizing('end')
+        }
+      }, [rightDragStream.signal]),
+    )
+
+    const removeStreamCleanup = this.scope.add(() => {
+      leftDragStream.cleanup()
+      rightDragStream.cleanup()
+    })
+
+    // A single handle bundling all three scope registrations above, so
+    // removeResizeHandles() can tear down just the resize-handle listeners
+    // (and deregister them from `scope`) without disposing the whole region.
+    this.resizeHandleCleanup = () => {
+      removeLeftEffect()
+      removeRightEffect()
+      removeStreamCleanup()
+      unsubscribeLeftScroll?.()
+      unsubscribeLeftScroll = null
+      unsubscribeRightScroll?.()
+      unsubscribeRightScroll = null
+    }
+  }
+
+  private removeResizeHandles(element: HTMLElement) {
+    if (this.resizeHandleCleanup) {
+      this.resizeHandleCleanup()
+      this.resizeHandleCleanup = null
+    }
+
+    const leftHandle = element.querySelector('[part*="region-handle-left"]')
+    const rightHandle = element.querySelector('[part*="region-handle-right"]')
+    if (leftHandle) {
+      element.removeChild(leftHandle)
+    }
+    if (rightHandle) {
+      element.removeChild(rightHandle)
+    }
+  }
+
+  private initElement(): HTMLElement | null {
+    if (this.isRemoved) return null
+
+    const isMarker = this.start === this.end
+
+    let elementTop = 0
+    let elementHeight = 100
+
+    if (this.channelIdx >= 0 && this.numberOfChannels > 0 && this.channelIdx < this.numberOfChannels) {
+      elementHeight = 100 / this.numberOfChannels
+      elementTop = elementHeight * this.channelIdx
+    }
+
+    const element = createElement('div', {
+      style: {
+        position: 'absolute',
+        top: `${elementTop}%`,
+        height: `${elementHeight}%`,
+        backgroundColor: isMarker ? 'none' : this.color,
+        borderLeft: isMarker ? '2px solid ' + this.color : 'none',
+        borderRadius: '2px',
+        boxSizing: 'border-box',
+        transition: 'background-color 0.2s ease',
+        cursor: this.drag ? 'grab' : 'default',
+        pointerEvents: 'all',
+      },
+    })
+
+    // Add resize handles
+    if (!isMarker && this.resize) {
+      this.addResizeHandles(element)
+    }
+
+    return element
+  }
+
+  private renderPosition() {
+    if (!this.element) return
+    const start = this.start / this.totalDuration
+    const end = (this.totalDuration - this.end) / this.totalDuration
+    this.element.style.left = `${start * 100}%`
+    this.element.style.right = `${end * 100}%`
+  }
+
+  private toggleCursor(toggle: boolean) {
+    if (!this.drag || !this.element?.style) return
+    this.element.style.cursor = toggle ? 'grabbing' : 'grab'
+  }
+
+  /** Attach the content click/blur listeners, first removing any existing pair */
+  private attachContentListeners() {
+    this.detachContentListeners()
+
+    if (!this.contentEditable || !this.content) return
+
+    const content = this.content
+    const removeClick = this.scope.listen(content, 'click', (e) => this.onContentClick(e as MouseEvent))
+    const removeBlur = this.scope.listen(content, 'blur', () => this.onContentBlur())
+
+    this.contentListenersCleanup = () => {
+      removeClick()
+      removeBlur()
+    }
+  }
+
+  /** Remove the content click/blur listeners, if attached */
+  private detachContentListeners() {
+    if (this.contentListenersCleanup) {
+      this.contentListenersCleanup()
+      this.contentListenersCleanup = null
+    }
+  }
+
+  private initMouseEvents() {
+    const { element } = this
+    if (!element) return
+
+    // Create event streams
+    const clicks = fromEvent(element, 'click')
+    const mouseenters = fromEvent(element, 'mouseenter')
+    const mouseleaves = fromEvent(element, 'mouseleave')
+    const dblclicks = fromEvent(element, 'dblclick')
+    const pointerdowns = fromEvent(element, 'pointerdown')
+    const pointerups = fromEvent(element, 'pointerup')
+    const touchends = fromEvent(element, 'touchend')
+
+    // Double-tap detection (#3927): many mobile browsers never fire 'dblclick'
+    // for touch input, so two touchend events on this region within
+    // DOUBLE_TAP_WINDOW synthesize the same 'dblclick' emission. Browsers that
+    // DO fire a native dblclick after a double tap would otherwise emit twice,
+    // so a native dblclick arriving shortly after a synthesized one is deduped.
+    let lastTapTime = 0
+    let lastSyntheticDblclickTime = 0
+
+    const emitDblclick = (e: MouseEvent) => this.emit('dblclick', e)
+
+    // Subscribe to streams
+    const unsubscribeClick = clicks.subscribe((e) => e && this.emit('click', e))
+    const unsubscribeMouseenter = mouseenters.subscribe((e) => e && this.emit('over', e))
+    const unsubscribeMouseleave = mouseleaves.subscribe((e) => e && this.emit('leave', e))
+    const unsubscribeDblclick = dblclicks.subscribe((e) => {
+      if (!e) return
+      // Skip the native dblclick some browsers still fire right after a
+      // double tap we've already synthesized an event for.
+      if (Date.now() - lastSyntheticDblclickTime <= DOUBLE_TAP_WINDOW * 2) return
+      emitDblclick(e)
+    })
+    const unsubscribeTouchend = touchends.subscribe((e) => {
+      if (!e) return
+      const now = Date.now()
+      if (lastTapTime && now - lastTapTime <= DOUBLE_TAP_WINDOW) {
+        lastTapTime = 0
+        lastSyntheticDblclickTime = now
+        // Emit a synthesized MouseEvent so the public event signature
+        // ('region-double-clicked': [region, e: MouseEvent]) stays unchanged.
+        // It is passed to listeners directly, never dispatched to the DOM.
+        const touch = e.changedTouches?.[0]
+        emitDblclick(
+          new MouseEvent('dblclick', {
+            bubbles: true,
+            cancelable: true,
+            clientX: touch?.clientX ?? 0,
+            clientY: touch?.clientY ?? 0,
+          }),
+        )
+      } else {
+        lastTapTime = now
+      }
+    })
+    const unsubscribePointerdown = pointerdowns.subscribe((e) => e && this.toggleCursor(true))
+    const unsubscribePointerup = pointerups.subscribe((e) => e && this.toggleCursor(false))
+
+    // Store cleanup
+    this.scope.add(() => {
+      unsubscribeClick()
+      unsubscribeMouseenter()
+      unsubscribeMouseleave()
+      unsubscribeDblclick()
+      unsubscribeTouchend()
+      unsubscribePointerdown()
+      unsubscribePointerup()
+      cleanupStream(clicks)
+      cleanupStream(mouseenters)
+      cleanupStream(mouseleaves)
+      cleanupStream(dblclicks)
+      cleanupStream(touchends)
+      cleanupStream(pointerdowns)
+      cleanupStream(pointerups)
+    })
+
+    // Drag
+    const dragStream = createDragStream(element)
+
+    const scrollState: ScrollState = { scrollLeft: 0 }
+    const onScroll = createScrollHandler(scrollState, (scrollDiff) => this.onMove(scrollDiff))
+    let unsubscribeScroll: (() => void) | null = null
+
+    this.scope.add(
+      effect(() => {
+        const drag = dragStream.signal.value
+        if (!drag) return
+
+        if (drag.type === 'start') {
+          this.toggleCursor(true)
+          this.isDragging = true
+          this.autoScrollDirection = this.getAutoScrollDirection()
+          scrollState.scrollLeft = this.wavesurfer?.getScroll() ?? 0
+          if (this.wavesurfer) {
+            // While dragging, container scroll keeps moving the region: each
+            // scroll delta is replayed as a move delta, which re-triggers the
+            // 'update' -> adjustScroll loop while the region hugs an edge.
+            unsubscribeScroll = this.scope.add(this.wavesurfer.on('scroll', onScroll))
+          }
+        } else if (drag.type === 'move' && drag.deltaX !== undefined) {
+          // deltaX is in client coordinates and doesn't account for the
+          // container auto-scrolling under the pointer -- add any scroll
+          // delta not yet seen by the scroll handler (shared scrollState
+          // guarantees each delta is only counted once).
+          const scrollLeft = this.wavesurfer?.getScroll() ?? scrollState.scrollLeft
+          const scrollDiff = scrollLeft - scrollState.scrollLeft
+          scrollState.scrollLeft = scrollLeft
+          this.onMove(drag.deltaX + scrollDiff)
+        } else if (drag.type === 'end') {
+          this.toggleCursor(false)
+          this.isDragging = false
+          this.autoScrollDirection = 'none'
+          unsubscribeScroll?.()
+          unsubscribeScroll = null
+          if (this.drag) this.emit('update-end')
+        }
+      }, [dragStream.signal]),
+    )
+    this.scope.add(() => dragStream.cleanup())
+
+    this.attachContentListeners()
+    this.mouseEventsInitialized = true
+  }
+
+  /**
+   * Which direction the container may auto-scroll for the drag that is
+   * starting: if a side of the region already overflows the container, only
+   * allow scrolling toward the opposite side (so a region parked against an
+   * edge doesn't immediately start scrolling further in that direction).
+   */
+  private getAutoScrollDirection(): AutoScrollDirection {
+    const scrollContainer = this.wavesurfer?.getWrapper()?.parentElement
+    const sideOverflow = getRegionSideOverflow(this.element, scrollContainer)
+    if (!sideOverflow) return 'none'
+
+    const { overflowLeft, overflowRight } = sideOverflow
+    if (overflowLeft > 0 && overflowRight > 0) return 'none'
+    if (overflowLeft > 0) return 'right'
+    if (overflowRight > 0) return 'left'
+    return 'both'
+  }
+
+  public _onUpdate(dx: number, side?: UpdateSide, startTime?: number, autoScrollDirection?: AutoScrollDirection) {
+    if (!this.element?.parentElement) return
+    const { width } = this.element.parentElement.getBoundingClientRect()
+    const deltaSeconds = (dx / width) * this.totalDuration
+    let newStart = !side || side === 'start' ? this.start + deltaSeconds : this.start
+    let newEnd = !side || side === 'end' ? this.end + deltaSeconds : this.end
+    const isRegionCreating = startTime !== undefined // startTime is passed when the region is being created.
+    if (isRegionCreating) {
+      if (this.updatingSide && this.updatingSide !== side) {
+        if (this.updatingSide === 'start') {
+          newStart = startTime
+        } else {
+          newEnd = startTime
+        }
+      }
+    }
+
+    if (!side) {
+      // Plain drag: the region translates rigidly. Clamp the DELTA (not each
+      // endpoint independently) so hitting either edge stops the region --
+      // per-endpoint clamping would pin one end while the other kept moving,
+      // permanently compressing the region against the edge.
+      const clampedDelta = Math.max(-this.start, Math.min(this.totalDuration - this.end, deltaSeconds))
+      newStart = this.start + clampedDelta
+      newEnd = this.end + clampedDelta
+    }
+
+    newStart = Math.max(0, newStart)
+    newEnd = Math.min(this.totalDuration, newEnd)
+    const length = newEnd - newStart
+
+    this.updatingSide = side
+    const resizeValid = length >= this.minLength && length <= this.maxLength
+    // During drag-creation the region necessarily grows through sub-minLength
+    // sizes, so only maxLength can be enforced mid-drag; minLength is enforced
+    // when the creation drag ends (see enableDragSelection).
+    const creationValid = isRegionCreating && length <= this.maxLength
+    if (newStart <= newEnd && (resizeValid || creationValid)) {
+      this.start = newStart
+      this.end = newEnd
+
+      this.renderPosition()
+      this.emit('update', side, autoScrollDirection)
+    }
+  }
+
+  private onMove(dx: number) {
+    if (!this.drag) return
+    this._onUpdate(dx, undefined, undefined, this.autoScrollDirection)
+  }
+
+  private onResize(dx: number, side: UpdateSide) {
+    if (!this.resize) return
+    if (!this.resizeStart && side === 'start') return
+    if (!this.resizeEnd && side === 'end') return
+    // Resizing may only auto-scroll toward the handle being dragged
+    this._onUpdate(dx, side, undefined, side === 'start' ? 'left' : 'right')
+  }
+
+  private onEndResizing(side: UpdateSide) {
+    if (!this.resize) return
+    this.emit('update-end', side)
+    this.updatingSide = undefined
+  }
+
+  private onContentClick(event: MouseEvent) {
+    event.stopPropagation()
+    const contentContainer = event.target as HTMLDivElement
+    contentContainer.focus()
+    this.emit('click', event)
+  }
+
+  public onContentBlur() {
+    this.emit('update-end')
+  }
+
+  public _setTotalDuration(totalDuration: number) {
+    this.totalDuration = totalDuration
+    this.renderPosition()
+  }
+
+  /** Play the region from the start, pass `true` to stop at region end */
+  public play(stopAtEnd?: boolean) {
+    this.emit('play', stopAtEnd && this.end !== this.start ? this.end : undefined)
+  }
+
+  /** Get Content as html or string */
+  public getContent(asHTML: boolean = false): string | HTMLElement | undefined {
+    if (asHTML) {
+      return this.content || undefined
+    }
+    if (this.element instanceof HTMLElement) {
+      return this.content?.innerHTML || undefined
+    }
+    return ''
+  }
+
+  /** Set the HTML content of the region */
+  public setContent(content: RegionParams['content']) {
+    if (!this.element) return
+
+    // Remove event listeners from old content before removing it
+    this.detachContentListeners()
+
+    const hadContent = !!this.content
+    this.content?.remove()
+    if (!content) {
+      this.content = undefined
+      // The labels that one was keeping down can move back up: the plugin restacks on
+      // `render`. Not `content-changed`, which is forwarded as the public
+      // `region-content-changed` and has never been emitted for a removal
+      if (hadContent) this.emit('render')
+      return
+    }
+    if (typeof content === 'string') {
+      const isMarker = this.start === this.end
+      this.content = createElement('div', {
+        style: {
+          padding: `0.2em ${isMarker ? 0.2 : 0.4}em`,
+          display: 'inline-block',
+        },
+        textContent: content,
+      })
+    } else {
+      this.content = content
+    }
+    if (this.contentEditable) {
+      this.content.contentEditable = 'true'
+      // Only (re)attach here when replacing content at runtime -- during construction,
+      // initMouseEvents() runs right after setContent() and is the single attachment point.
+      if (this.mouseEventsInitialized) {
+        this.attachContentListeners()
+      }
+    }
+    this.content.setAttribute('part', 'region-content')
+    this.element.appendChild(this.content)
+    this.emit('content-changed')
+  }
+
+  /** Update the region's options */
+  public setOptions(
+    options: Partial<
+      Pick<
+        RegionParams,
+        | 'color'
+        | 'start'
+        | 'end'
+        | 'drag'
+        | 'content'
+        | 'id'
+        | 'resize'
+        | 'resizeStart'
+        | 'resizeEnd'
+        | 'avoidOverlapping'
+      >
+    >,
+  ) {
+    if (!this.element) return
+
+    if (options.color) {
+      this.color = options.color
+      this.element.style.backgroundColor = this.color
+    }
+
+    if (options.drag !== undefined) {
+      this.drag = options.drag
+      this.element.style.cursor = this.drag ? 'grab' : 'default'
+    }
+
+    if (options.start !== undefined || options.end !== undefined) {
+      const wasMarker = this.start === this.end
+      this.start = this.clampPosition(options.start ?? this.start)
+      this.end = this.clampPosition(options.end ?? (wasMarker ? this.start : this.end))
+      this.renderPosition()
+      this.setPart()
+
+      // A marker turned into a range (or vice versa) must not keep its stale
+      // styling: swap the background/border and add/remove the resize handles
+      // to match what initElement() would have produced for the new shape.
+      const isMarker = this.start === this.end
+      if (isMarker !== wasMarker) {
+        this.element.style.backgroundColor = isMarker ? '' : this.color
+        this.element.style.borderLeft = isMarker ? '2px solid ' + this.color : 'none'
+        if (this.resize) {
+          if (isMarker) {
+            this.removeResizeHandles(this.element)
+          } else {
+            this.addResizeHandles(this.element)
+          }
+        }
+      }
+
+      this.emit('render')
+    }
+
+    // Before setContent, so only the content the plugin may have placed is reset
+    if (options.avoidOverlapping !== undefined && options.avoidOverlapping !== this.avoidOverlapping) {
+      this.avoidOverlapping = options.avoidOverlapping
+      if (!this.avoidOverlapping && this.content) this.content.style.removeProperty('margin-top')
+      // The plugin stacks the other labels around this one, or no longer needs to
+      this.emit('render')
+    }
+
+    if (options.content) {
+      this.setContent(options.content)
+    }
+
+    if (options.id) {
+      this.id = options.id
+      this.setPart()
+    }
+
+    if (options.resize !== undefined && options.resize !== this.resize) {
+      const isMarker = this.start === this.end
+      this.resize = options.resize
+      if (this.resize && !isMarker) {
+        this.addResizeHandles(this.element)
+      } else {
+        this.removeResizeHandles(this.element)
+      }
+    }
+
+    if (options.resizeStart !== undefined) {
+      this.resizeStart = options.resizeStart
+    }
+
+    if (options.resizeEnd !== undefined) {
+      this.resizeEnd = options.resizeEnd
+    }
+  }
+
+  /** Remove the region */
+  public remove() {
+    this.isRemoved = true
+    this.emit('remove')
+
+    // Clean up all of this region's listener bookkeeping in one shot: mouse
+    // events, drag/resize streams, content listeners (and any plugin-level
+    // per-region listeners registered onto this same scope, e.g. saveRegion's
+    // region.on('update', ...) subscriptions).
+    this.scope.dispose()
+
+    // Belt-and-braces: detachContentListeners() is idempotent (a no-op once
+    // scope.dispose() has already run the same removers).
+    this.detachContentListeners()
+
+    // Remove DOM element
+    if (this.element) {
+      this.element.remove()
+      this.element = null
+    }
+
+    // Clear all event listeners from the EventEmitter
+    this.unAll()
+  }
+}
+
+/**
+ * Tolerance (in seconds) applied at a region's START boundary when deciding
+ * whether the current time is inside the region.
+ *
+ * Seeking to `region.start` — which is exactly what `region.play()` does via
+ * `wavesurfer.play(region.start, end)` — is not guaranteed to land the next
+ * 'timeupdate' at or after `start`: media elements clamp/round `currentTime`
+ * (notably the MediaElement backend in Chrome, and any start with many
+ * decimals, e.g. 9.16454684654654), so the first tick can arrive a hair
+ * BEFORE `start`. With an exact `start <= currentTime` comparison the region
+ * then counts as "not entered", which fired a spurious 'region-out' for the
+ * previously active region and caused region-in/region-out ping-pong loops
+ * when jumping between regions (#3631, #3658, #3781, #3866).
+ *
+ * 0.05s matches the window already used for zero-length (marker) regions and
+ * is far below typical 'timeupdate' granularity (~100–250ms), so at worst
+ * 'region-in' fires one tick (~50ms of audio) early during linear playback.
+ * The END boundary stays exact so 'region-out' is not delayed.
+ */
+const REGION_BOUNDARY_TOLERANCE = 0.05
+
+/**
+ * Two taps on the same region within this window (ms) count as a double tap
+ * and emit 'region-double-clicked' (native 'dblclick' does not fire for touch
+ * input on many mobile browsers — #3927). 300ms is the conventional
+ * double-tap threshold used by mobile browsers themselves.
+ */
+const DOUBLE_TAP_WINDOW = 300
+
+// The public surface returned by setup() below: getRegions/addRegion/
+// enableDragSelection/clearRegions are RegionsPlugin's only public API
+// methods (destroy is chassis-owned by definePlugin, not part of Api).
+type Api = {
+  getRegions: () => Region[]
+  addRegion: (options: RegionParams) => Region
+  enableDragSelection: (options: Omit<RegionParams, 'start' | 'end'>, threshold?: number) => () => void
+  clearRegions: () => void
+}
+
+const RegionsPlugin = definePlugin<RegionsPluginOptions | Record<string, never>, RegionsPluginEvents, Api>(
+  'RegionsPlugin',
+  (ctx) => {
+    // setup-closure state — replaces the pre-port instance fields `regions` and
+    // the onInit()-local `activeRegions`.
+    let regions: Region[] = []
+    let activeRegions: Region[] = []
+
+    const regionsContainer = createElement('div', {
+      part: 'regions-container',
+      style: {
+        position: 'absolute',
+        top: '0',
+        left: '0',
+        width: '100%',
+        height: '100%',
+        zIndex: '5',
+        pointerEvents: 'none',
+      },
+    })
+    ctx.wavesurfer.getWrapper().appendChild(regionsContainer)
+    // DESTROY-ORDER: the pre-port class removed regionsContainer AFTER
+    // super.destroy() (so a 'destroy' listener could still observe it
+    // attached). Neither regions.test.ts nor memory-leaks.test.ts's regions
+    // cases (#4243) assert anything about post-destroy DOM attachment of the
+    // regions container, so — per the chassis's per-plugin rule in
+    // define-plugin.ts — this follows hover's precedent and moves
+    // removal onto ctx.scope: a deliberate, documented behavior change
+    // (removal now happens BEFORE the 'destroy' event, alongside every other
+    // scope-owned teardown, instead of after).
+    ctx.scope.add(() => regionsContainer.remove())
+
+    // Update region durations when a new audio file is loaded
+    ctx.scope.add(
+      ctx.wavesurfer.on('ready', (duration) => {
+        regions.forEach((region) => region._setTotalDuration(duration))
+      }),
+    )
+
+    ctx.scope.add(
+      ctx.wavesurfer.on('timeupdate', (currentTime) => {
+        // Detect when regions are being played. The start boundary gets a
+        // small tolerance so a seek to region.start that settles slightly
+        // before it (media-element clamping/rounding) still counts as inside —
+        // see REGION_BOUNDARY_TOLERANCE. Zero-length regions keep their
+        // existing `start + 0.05` window at the end boundary.
+        const playedRegions = regions.filter(
+          (region) =>
+            region.start - REGION_BOUNDARY_TOLERANCE <= currentTime &&
+            (region.end === region.start ? region.start + 0.05 : region.end) >= currentTime,
+        )
+
+        // Trigger region-in when activeRegions doesn't include a played regions
+        playedRegions.forEach((region) => {
+          if (!activeRegions.includes(region)) {
+            ctx.emit('region-in', region)
+          }
+        })
+
+        // Trigger region-out when activeRegions include a un-played regions
+        activeRegions.forEach((region) => {
+          if (!playedRegions.includes(region)) {
+            ctx.emit('region-out', region)
+          }
+        })
+
+        // Update activeRegions only played regions
+        activeRegions = playedRegions
+      }),
+    )
+
+    function getRegions(): Region[] {
+      return regions
+    }
+
+    // Labels that would cover one another are stacked: a label moves down until
+    // it clears the earlier labels in its way, so only regions before it in the
+    // list can push it (otherwise both of two overlapping regions would move
+    // away from each other). Only a label whose region is in the DOM can be
+    // measured, and only one in the DOM can be seen, so only those take part:
+    // that is why the stacking is repeated whenever the regions in the DOM
+    // change, which also stacks the labels of regions that were off screen when
+    // they were created and scrolled into view later.
+    //
+    // Scrolling changes the regions in the DOM without changing where any region
+    // is, so a stacking that follows a scroll (`keepRaised`) starts each label
+    // from the margin it was last given: a label that an earlier label pushed
+    // down stays down when that one scrolls out of the DOM, and is not pushed
+    // down again when it scrolls back in. Anything that can change which labels
+    // overlap (a zoom or resize, new audio, a region added, moved, removed or
+    // changed) stacks from scratch.
+    let stackedMargins = new WeakMap<HTMLElement, number>()
+    function stackLabels(keepRaised = false) {
+      if (!keepRaised) stackedMargins = new WeakMap()
+      const labels: HTMLElement[] = []
+      for (const region of regions) {
+        const label = region.content
+        if (!label || region.isRemoved || !region.avoidOverlapping || !region.element?.parentElement) continue
+        // A region mounted in the regions container is still not in the page when the
+        // whole waveform is detached from the document: it has no box to measure
+        if (!label.isConnected) continue
+        labels.push(label)
+      }
+      if (labels.length === 0) return
+
+      // Every label is measured with no margin, then the margins are worked out
+      // from those measurements alone: one layout for all of them
+      const previous = labels.map((label) => label.style.marginTop)
+      for (const label of labels) label.style.marginTop = '0'
+      const boxes = labels.map((label) => label.getBoundingClientRect())
+
+      // Nothing laid out -- a `display: none` somewhere above the waveform -- measures
+      // every label as nothing, and the margins it had are still the right ones
+      if (boxes.every((box) => box.width === 0 && box.height === 0)) {
+        labels.forEach((label, i) => {
+          label.style.marginTop = previous[i]
+        })
+        return
+      }
+
+      const floors = keepRaised ? labels.map((label) => stackedMargins.get(label) ?? 0) : undefined
+      const margins = computeLabelMargins(boxes, floors)
+      labels.forEach((label, i) => {
+        label.style.marginTop = `${margins[i]}px`
+        stackedMargins.set(label, margins[i])
+      })
+    }
+
+    // Stacking waits a moment, and is done once however many regions asked for it
+    // in the meantime (adding thousands of regions, or removing them)
+    let cancelStacking: (() => void) | null = null
+    function requestStacking() {
+      if (cancelStacking) return
+      cancelStacking = ctx.scope.timeout(() => {
+        cancelStacking = null
+        stackLabels()
+      }, 10)
+    }
+
+    function adjustScroll(region: Region, direction?: AutoScrollDirection) {
+      if (!direction || direction === 'none') return
+      const scrollContainer = ctx.wavesurfer?.getWrapper()?.parentElement
+      const sideOverflow = getRegionSideOverflow(region.element, scrollContainer)
+      if (!scrollContainer || !sideOverflow) return
+
+      const { overflowLeft, overflowRight } = sideOverflow
+
+      // If both sides overflow (region wider than the viewport), only scroll
+      // in the single direction the gesture is headed
+      if (overflowLeft > 0 && overflowRight > 0) {
+        if (direction === 'left') {
+          scrollContainer.scrollLeft -= overflowLeft
+        } else if (direction === 'right') {
+          scrollContainer.scrollLeft += overflowRight
+        }
+        return
+      }
+
+      if (direction === 'left' || direction === 'both') {
+        scrollContainer.scrollLeft -= overflowLeft
+      }
+      if (direction === 'right' || direction === 'both') {
+        scrollContainer.scrollLeft += overflowRight
+      }
+    }
+
+    // Regions are only kept in the DOM while they intersect the viewport. A
+    // single plugin-level pass serves all of them: the viewport is measured once
+    // per scroll/zoom/resize (not once per region), each region's visibility is
+    // plain arithmetic, and the DOM changes are applied only after every region
+    // has been checked, so mounting one region never forces a layout for the
+    // next region's check. virtualAppend starts tracking a region by adding it to
+    // `virtualRegions`, which holds the tracked regions in the order tracking
+    // started (a Set keeps that order and makes removal O(1)); mounts happen in
+    // that order, so overlapping regions stack as before.
+    const virtualRegions = new Set<Region>()
+
+    type Viewport = { clientWidth: number; scrollLeft: number; scrollWidth: number; duration: number }
+
+    function readViewport(): Viewport | null {
+      if (!ctx.wavesurfer) return null
+      return {
+        clientWidth: ctx.wavesurfer.getWidth(),
+        scrollLeft: ctx.wavesurfer.getScroll(),
+        scrollWidth: regionsContainer.clientWidth,
+        duration: ctx.wavesurfer.getDuration(),
+      }
+    }
+
+    /** Mount or unmount the candidates that need it, and say whether it changed which regions are in the DOM */
+    function syncVirtualRegions(candidates: Iterable<Region>): boolean {
+      const viewport = readViewport()
+      if (!viewport) return false
+      const { clientWidth, scrollLeft, scrollWidth, duration } = viewport
+
+      const toMount: HTMLElement[] = []
+      const toUnmount: HTMLElement[] = []
+      for (const region of candidates) {
+        const element = region.element
+        if (!element) continue
+
+        const start = Math.round((region.start / duration) * scrollWidth)
+        const width = Math.round(((region.end - region.start) / duration) * scrollWidth) || 1
+
+        // Check if the region is between the scrollLeft and scrollLeft + clientWidth
+        const isVisible = start + width > scrollLeft && start < scrollLeft + clientWidth
+
+        if (isVisible && !element.parentElement) {
+          toMount.push(element)
+        } else if (!isVisible && element.parentElement && !region.isDragging) {
+          // Never detach a region mid-drag: auto-scrolling can briefly push it
+          // out of view, and removing it would end the gesture
+          toUnmount.push(element)
+        }
+      }
+
+      toUnmount.forEach((element) => element.remove())
+      toMount.forEach((element) => regionsContainer.appendChild(element))
+      return toUnmount.length > 0 || toMount.length > 0
+    }
+
+    // Scrolling only moves the labels around when it changed which regions are in
+    // the DOM, and then only down; a zoom or resize changes every region's width,
+    // and with it how its label wraps, so stacks from scratch. Both are stacked at
+    // once, before anything is painted.
+    ctx.scope.add(
+      ctx.wavesurfer.on('scroll', () => {
+        if (virtualRegions.size > 0 && syncVirtualRegions(virtualRegions)) stackLabels(true)
+      }),
+    )
+    const syncAfterResize = () => {
+      if (virtualRegions.size === 0) return
+      syncVirtualRegions(virtualRegions)
+      stackLabels()
+    }
+    ctx.scope.add(ctx.wavesurfer.on('zoom', syncAfterResize))
+    ctx.scope.add(ctx.wavesurfer.on('resize', syncAfterResize))
+    // New audio changes where every region is: registered after the handler above that
+    // moves the regions to the new duration, so this one sees their new positions
+    ctx.scope.add(ctx.wavesurfer.on('ready', syncAfterResize))
+
+    // `regionScope` is the same child scope SingleRegion itself owns (created
+    // in addRegion/enableDragSelection and passed into its constructor). Once
+    // ('remove'), the three previously hand-rolled `subscriptions`-array splice
+    // sites (virtualAppend, saveRegion, addRegion's once('ready')) are gone:
+    // everything below is torn down for free when region.remove() disposes
+    // this same scope.
+    function virtualAppend(region: Region, regionScope: Scope) {
+      regionScope.timeout(() => {
+        // Check if region was removed before this timeout executed (defensive;
+        // the timeout itself is cancelled by regionScope.dispose() when the
+        // region is removed first, so this should already be unreachable then).
+        if (!ctx.wavesurfer || !region.element) return
+        virtualRegions.add(region)
+        regionScope.add(() => virtualRegions.delete(region))
+        syncVirtualRegions([region])
+
+        regionScope.add(
+          region.on('render', () => {
+            syncVirtualRegions([region])
+            requestStacking()
+          }),
+        )
+      }, 0)
+    }
+
+    function saveRegion(region: Region, regionScope: Scope) {
+      if (!region.element) return
+      virtualAppend(region, regionScope)
+      requestStacking()
+      regions.push(region)
+
+      regionScope.add(
+        region.on('update', (side, autoScrollDirection) => {
+          adjustScroll(region, autoScrollDirection)
+          ctx.emit('region-update', region, side)
+        }),
+      )
+
+      regionScope.add(
+        region.on('update-end', (side) => {
+          requestStacking()
+          ctx.emit('region-updated', region, side)
+        }),
+      )
+
+      regionScope.add(
+        region.on('play', (end?: number) => {
+          ctx.wavesurfer?.play(region.start, end)
+        }),
+      )
+
+      regionScope.add(
+        region.on('click', (e) => {
+          ctx.emit('region-clicked', region, e)
+        }),
+      )
+
+      regionScope.add(
+        region.on('dblclick', (e) => {
+          ctx.emit('region-double-clicked', region, e)
+        }),
+      )
+
+      regionScope.add(
+        region.on('content-changed', () => {
+          requestStacking()
+          ctx.emit('region-content-changed', region)
+        }),
+      )
+
+      // Remove the region from the list when it's removed. This is the only
+      // bookkeeping left that isn't scope-owned teardown (the six listeners
+      // above die automatically with regionScope, disposed by region.remove());
+      // pruning `regions` and emitting 'region-removed' are active side effects
+      // that must run in response to the event itself.
+      region.once('remove', () => {
+        regions = regions.filter((reg) => reg !== region)
+        // The labels it was keeping others below can move back up
+        requestStacking()
+        ctx.emit('region-removed', region)
+      })
+
+      ctx.emit('region-created', region)
+    }
+
+    /** Create a region with given parameters */
+    function addRegion(options: RegionParams): Region {
+      if (!ctx.wavesurfer) {
+        // The api only exists after init, so a missing wavesurfer means
+        // destroy() has run. Post-destroy contract (matches core WaveSurfer):
+        // public mutators silently no-op — return an inert, already-removed
+        // region instead of throwing.
+        const region = new SingleRegion(options, 0, new Scope())
+        region.remove()
+        return region
+      }
+
+      const duration = ctx.wavesurfer.getDuration()
+      const numberOfChannels = ctx.wavesurfer.getDecodedData()?.numberOfChannels
+      const regionScope = ctx.scope.child()
+      const region = new SingleRegion(options, duration, regionScope, numberOfChannels, ctx.wavesurfer)
+      ctx.emit('region-initialized', region)
+
+      if (!duration) {
+        // Registered on regionScope instead of a plugin-level subscriptions
+        // array: if the region is removed before wavesurfer becomes ready,
+        // regionScope.dispose() (via region.remove()) cancels this pending
+        // listener along with everything else — no manual splice needed.
+        regionScope.add(
+          ctx.wavesurfer.once('ready', (readyDuration) => {
+            region._setTotalDuration(readyDuration)
+            saveRegion(region, regionScope)
+          }),
+        )
+      } else {
+        saveRegion(region, regionScope)
+      }
+
+      return region
+    }
+
+    /**
+     * Enable creation of regions by dragging on an empty space on the waveform.
+     * Returns a function to disable the drag selection.
+     */
+    function enableDragSelection(options: Omit<RegionParams, 'start' | 'end'>, threshold = 3): () => void {
+      const wrapper = ctx.wavesurfer?.getWrapper()
+      if (!wrapper || !(wrapper instanceof HTMLElement)) return () => undefined
+
+      const initialSize = 5
+      let region: Region | null = null
+      let regionScope: Scope | null = null
+      let startX = 0
+      let startTime = 0
+
+      const dragStream = createDragStream(wrapper, { threshold })
+
+      // While creating a region, container scroll keeps growing it: each
+      // scroll delta is replayed as an update to the edge being dragged, and
+      // the container is kept scrolled to that edge.
+      const scrollState: ScrollState = { scrollLeft: 0 }
+      const onScroll = createScrollHandler(scrollState, (scrollDiff) => {
+        if (region && scrollDiff !== 0) {
+          region._onUpdate(scrollDiff, scrollDiff > 0 ? 'end' : 'start', startTime)
+          // Keep scrolling toward the edge being grown. A concrete direction
+          // (not 'both') so the loop keeps going even once the drag-created
+          // region has grown wider than the viewport (adjustScroll ignores
+          // 'both' when both sides overflow).
+          adjustScroll(region, scrollDiff > 0 ? 'right' : 'left')
+        }
+      })
+      let unsubscribeScroll: (() => void) | null = null
+
+      const unsubscribe = effect(() => {
+        const drag = dragStream.signal.value
+        if (!drag) return
+
+        if (drag.type === 'start') {
+          // On drag start
+
+          // A previous gesture's region/scope, if any, was never saved (no
+          // matching 'end' arrived — e.g. an aborted or superseded drag).
+          // Dispose it now rather than leaving it retained until the plugin
+          // itself is destroyed.
+          regionScope?.dispose()
+          unsubscribeScroll?.()
+          unsubscribeScroll = null
+
+          startX = drag.x
+          if (!ctx.wavesurfer) return
+          scrollState.scrollLeft = ctx.wavesurfer.getScroll()
+          unsubscribeScroll = ctx.scope.add(ctx.wavesurfer.on('scroll', onScroll))
+          const duration = ctx.wavesurfer.getDuration()
+          const numberOfChannels = ctx.wavesurfer?.getDecodedData()?.numberOfChannels
+          const { width } = ctx.wavesurfer.getWrapper().getBoundingClientRect()
+          startTime = (startX / width) * duration
+
+          // Calculate the start time of the region
+          const start = (drag.x / width) * duration
+          // Give the region a small initial size
+          const end = ((drag.x + initialSize) / width) * duration
+
+          // Create a region but don't save it until the drag ends
+          regionScope = ctx.scope.child()
+          region = new SingleRegion(
+            {
+              ...options,
+              start,
+              end,
+            },
+            duration,
+            regionScope,
+            numberOfChannels,
+            ctx.wavesurfer,
+          )
+
+          ctx.emit('region-initialized', region)
+
+          // Just add it to the DOM for now
+          if (region.element) {
+            regionsContainer.appendChild(region.element)
+          }
+        } else if (drag.type === 'move' && drag.deltaX !== undefined) {
+          // On drag move
+          if (region) {
+            // Update the end position of the region
+            // If we're dragging to the left, we need to update the start instead
+            region._onUpdate(drag.deltaX, drag.x > startX ? 'end' : 'start', startTime)
+            // Auto-scroll toward the edge being dragged
+            adjustScroll(region, drag.x > startX ? 'right' : 'left')
+          }
+        } else if (drag.type === 'end') {
+          // On drag end
+          unsubscribeScroll?.()
+          unsubscribeScroll = null
+          if (region && regionScope) {
+            // Enforce minLength on the just-created region: mid-drag it
+            // necessarily passes through sub-minLength sizes (see _onUpdate),
+            // so the length contract is applied when the creation finishes.
+            if (region.end - region.start < region.minLength) {
+              const duration = ctx.wavesurfer?.getDuration() ?? 0
+              const end = Math.min(duration, region.start + region.minLength)
+              const start = Math.max(0, end - region.minLength)
+              region.setOptions({ start, end })
+            }
+            saveRegion(region, regionScope)
+            region.updatingSide = undefined
+            region = null
+            regionScope = null
+          }
+        }
+      }, [dragStream.signal])
+
+      // The returned disposer IS the scope.add(...) remover — calling it both
+      // runs the cleanup and deregisters it from ctx.scope, so a manual
+      // splice-out of a plugin-level subscriptions array is no longer needed.
+      return ctx.scope.add(() => {
+        unsubscribe()
+        dragStream.cleanup()
+        // A creation gesture may be mid-flight when drag selection is
+        // disabled: drop its scroll listener too, or waveform scrolls would
+        // keep mutating the abandoned region until the plugin is destroyed.
+        unsubscribeScroll?.()
+        unsubscribeScroll = null
+      })
+    }
+
+    /** Remove all regions */
+    function clearRegions() {
+      const regionsToRemove = regions.slice()
+      regionsToRemove.forEach((region) => region.remove())
+      regions = []
+    }
+
+    // Equivalent of the pre-port destroy() override's `this.clearRegions()`
+    // call: explicitly remove()s every region (emitting 'remove'/'region-removed'
+    // and clearing region.element) rather than relying solely on the implicit
+    // ctx.scope -> regionScope cascade, which would dispose each region's raw
+    // listeners but skip SingleRegion.remove()'s other side effects.
+    ctx.scope.add(() => clearRegions())
+
+    return {
+      getRegions,
+      addRegion,
+      enableDragSelection,
+      clearRegions,
+    }
+  },
+)
+
+export default RegionsPlugin
+export type Region = SingleRegion
