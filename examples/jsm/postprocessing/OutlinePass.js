@@ -1,17 +1,21 @@
 import {
 	AdditiveBlending,
 	Color,
+	DataTexture,
 	DoubleSide,
 	HalfFloatType,
 	Matrix4,
 	MeshDepthMaterial,
+	NearestFilter,
 	NoBlending,
+	RedFormat,
 	RGBADepthPacking,
 	ShaderMaterial,
 	UniformsUtils,
 	Vector2,
 	Vector3,
-	WebGLRenderTarget
+	WebGLRenderTarget,
+	UnsignedByteType
 } from 'three';
 import { Pass, FullScreenQuad } from './Pass.js';
 import { CopyShader } from '../shaders/CopyShader.js';
@@ -63,6 +67,18 @@ class OutlinePass extends Pass {
 		 * @type {Array<Object3D>}
 		 */
 		this.selectedObjects = selectedObjects !== undefined ? selectedObjects : [];
+
+		/**
+		 * Per-instance selection for `InstancedMesh` objects. The keys are the
+		 * selected `InstancedMesh` objects, the values are `Set` instances holding
+		 * the selected instance IDs. Use {@link OutlinePass#setSelectedInstances}
+		 * to assign selections. An `InstancedMesh` that is also part of
+		 * {@link OutlinePass#selectedObjects} is outlined as a whole and per-instance
+		 * selection for that mesh is ignored.
+		 *
+		 * @type {Map<InstancedMesh, Set<number>>}
+		 */
+		this.selectedInstances = new Map();
 
 		/**
 		 * The visible edge color.
@@ -141,6 +157,9 @@ class OutlinePass extends Pass {
 
 		this._visibilityCache = new Map();
 		this._selectionCache = new Set();
+		this._instanceSelectionCache = new Map();
+		this._instanceFilterCallback = null;
+		this._instanceFilterMeshes = [];
 
 		/**
 		 * The effect's resolution.
@@ -161,6 +180,7 @@ class OutlinePass extends Pass {
 		this.depthMaterial.side = DoubleSide;
 		this.depthMaterial.depthPacking = RGBADepthPacking;
 		this.depthMaterial.blending = NoBlending;
+		this._setupInstanceFilter( this.depthMaterial, true );
 
 		this.prepareMaskMaterial = this._getPrepareMaskMaterial();
 		this.prepareMaskMaterial.side = DoubleSide;
@@ -263,6 +283,10 @@ class OutlinePass extends Pass {
 
 		this._fsQuad.dispose();
 
+		for ( const texture of this._instanceSelectionCache.values() ) texture.dispose();
+		this._instanceSelectionCache.clear();
+		this.selectedInstances.clear();
+
 	}
 
 	/**
@@ -306,7 +330,9 @@ class OutlinePass extends Pass {
 	 */
 	render( renderer, writeBuffer, readBuffer, deltaTime, maskActive ) {
 
-		if ( this.selectedObjects.length > 0 ) {
+		const hasSelection = this.selectedObjects.length > 0 || this._hasInstanceSelection();
+
+		if ( hasSelection ) {
 
 			renderer.getClearColor( this._oldClearColor );
 			this.oldClearAlpha = renderer.getClearAlpha();
@@ -320,115 +346,151 @@ class OutlinePass extends Pass {
 
 			this._updateSelectionCache();
 
-			// Make selected objects invisible
-			this._changeVisibilityOfSelectedObjects( false );
-
 			const currentBackground = this.renderScene.background;
 			const currentOverrideMaterial = this.renderScene.overrideMaterial;
 			this.renderScene.background = null;
 
-			// 1. Draw Non Selected objects in the depth buffer
-			this.renderScene.overrideMaterial = this.depthMaterial;
-			renderer.setRenderTarget( this.renderTargetDepthBuffer );
-			renderer.clear();
-			renderer.render( this.renderScene, this.renderCamera );
-
-			// Make selected objects visible
-			this._changeVisibilityOfSelectedObjects( true );
-			this._visibilityCache.clear();
-
 			// Update Texture Matrix for Depth compare
 			this._updateTextureMatrix();
 
-			// Make non selected objects invisible, and draw only the selected objects, by comparing the depth buffer of non selected objects
-			this._changeVisibilityOfNonSelectedObjects( false );
-			this.renderScene.overrideMaterial = this.prepareMaskMaterial;
-			this.prepareMaskMaterial.uniforms[ 'cameraNearFar' ].value.set( this.renderCamera.near, this.renderCamera.far );
-			this.prepareMaskMaterial.uniforms[ 'depthTexture' ].value = this.renderTargetDepthBuffer.texture;
-			this.prepareMaskMaterial.uniforms[ 'textureMatrix' ].value = this.textureMatrix;
-			renderer.setRenderTarget( this.renderTargetMaskBuffer );
-			renderer.clear();
-			renderer.render( this.renderScene, this.renderCamera );
-			this._changeVisibilityOfNonSelectedObjects( true );
-			this._visibilityCache.clear();
-			this._selectionCache.clear();
+			try {
 
-			this.renderScene.background = currentBackground;
-			this.renderScene.overrideMaterial = currentOverrideMaterial;
+				this._updateInstanceSelectionTextures();
 
-			// 2. Downsample to Half resolution
-			this._fsQuad.material = this.materialCopy;
-			this.copyUniforms[ 'tDiffuse' ].value = this.renderTargetMaskBuffer.texture;
-			renderer.setRenderTarget( this.renderTargetMaskDownSampleBuffer );
-			renderer.clear();
-			this._fsQuad.render( renderer );
+				try {
 
-			this.tempPulseColor1.copy( this.visibleEdgeColor );
-			this.tempPulseColor2.copy( this.hiddenEdgeColor );
+					// 1. Depth pass. Fully selected objects are hidden entirely. Partially
+					// selected InstancedMesh objects are hidden for the main scene draw and
+					// then rendered separately with the unselected instances only, so both
+					// regular occluders and non-selected instances of the same batch write
+					// into the depth buffer.
+					this._setSceneVisibility( 'depth-main' );
+					this.renderScene.overrideMaterial = this.depthMaterial;
+					renderer.setRenderTarget( this.renderTargetDepthBuffer );
+					renderer.clear();
+					renderer.render( this.renderScene, this.renderCamera );
 
-			if ( this.pulsePeriod > 0 ) {
+					if ( this._instanceFilterMeshes.length > 0 ) {
 
-				const scalar = ( 1 + 0.25 ) / 2 + Math.cos( performance.now() * 0.01 / this.pulsePeriod ) * ( 1.0 - 0.25 ) / 2;
-				this.tempPulseColor1.multiplyScalar( scalar );
-				this.tempPulseColor2.multiplyScalar( scalar );
+						this._setSceneVisibility( 'depth-instances' );
+						this._bindInstanceFilter( this.depthMaterial );
+						renderer.clearDepth();
+						renderer.render( this.renderScene, this.renderCamera );
+
+					}
+
+					// 2. Mask pass. Render only the selected geometry and compare it against
+					// the depth buffer of everything that can occlude it.
+					this._setSceneVisibility( 'mask-main' );
+					this.renderScene.overrideMaterial = this.prepareMaskMaterial;
+					this.prepareMaskMaterial.uniforms[ 'cameraNearFar' ].value.set( this.renderCamera.near, this.renderCamera.far );
+					this.prepareMaskMaterial.uniforms[ 'depthTexture' ].value = this.renderTargetDepthBuffer.texture;
+					this.prepareMaskMaterial.uniforms[ 'textureMatrix' ].value = this.textureMatrix;
+					renderer.setRenderTarget( this.renderTargetMaskBuffer );
+					renderer.clear();
+					renderer.render( this.renderScene, this.renderCamera );
+
+					if ( this._instanceFilterMeshes.length > 0 ) {
+
+						this._setSceneVisibility( 'mask-instances' );
+						this._bindInstanceFilter( this.prepareMaskMaterial );
+						renderer.clearDepth();
+						renderer.render( this.renderScene, this.renderCamera );
+
+					}
+
+				} finally {
+
+					this._unbindInstanceFilter( this.depthMaterial );
+					this._unbindInstanceFilter( this.prepareMaskMaterial );
+					this._restoreSceneVisibility();
+					this._visibilityCache.clear();
+					this._selectionCache.clear();
+					this._instanceFilterMeshes.length = 0;
+					this.renderScene.background = currentBackground;
+					this.renderScene.overrideMaterial = currentOverrideMaterial;
+
+				}
+
+				// 2. Downsample to Half resolution
+				this._fsQuad.material = this.materialCopy;
+				this.copyUniforms[ 'tDiffuse' ].value = this.renderTargetMaskBuffer.texture;
+				renderer.setRenderTarget( this.renderTargetMaskDownSampleBuffer );
+				renderer.clear();
+				this._fsQuad.render( renderer );
+
+				this.tempPulseColor1.copy( this.visibleEdgeColor );
+				this.tempPulseColor2.copy( this.hiddenEdgeColor );
+
+				if ( this.pulsePeriod > 0 ) {
+
+					const scalar = ( 1 + 0.25 ) / 2 + Math.cos( performance.now() * 0.01 / this.pulsePeriod ) * ( 1.0 - 0.25 ) / 2;
+					this.tempPulseColor1.multiplyScalar( scalar );
+					this.tempPulseColor2.multiplyScalar( scalar );
+
+				}
+
+				// 3. Apply Edge Detection Pass
+				this._fsQuad.material = this.edgeDetectionMaterial;
+				this.edgeDetectionMaterial.uniforms[ 'maskTexture' ].value = this.renderTargetMaskDownSampleBuffer.texture;
+				this.edgeDetectionMaterial.uniforms[ 'texSize' ].value.set( this.renderTargetMaskDownSampleBuffer.width, this.renderTargetMaskDownSampleBuffer.height );
+				this.edgeDetectionMaterial.uniforms[ 'visibleEdgeColor' ].value = this.tempPulseColor1;
+				this.edgeDetectionMaterial.uniforms[ 'hiddenEdgeColor' ].value = this.tempPulseColor2;
+				renderer.setRenderTarget( this.renderTargetEdgeBuffer1 );
+				renderer.clear();
+				this._fsQuad.render( renderer );
+
+				// 4. Apply Blur on Half res
+				this._fsQuad.material = this.separableBlurMaterial1;
+				this.separableBlurMaterial1.uniforms[ 'colorTexture' ].value = this.renderTargetEdgeBuffer1.texture;
+				this.separableBlurMaterial1.uniforms[ 'direction' ].value = OutlinePass.BlurDirectionX;
+				this.separableBlurMaterial1.uniforms[ 'kernelRadius' ].value = this.edgeThickness;
+				renderer.setRenderTarget( this.renderTargetBlurBuffer1 );
+				renderer.clear();
+				this._fsQuad.render( renderer );
+				this.separableBlurMaterial1.uniforms[ 'colorTexture' ].value = this.renderTargetBlurBuffer1.texture;
+				this.separableBlurMaterial1.uniforms[ 'direction' ].value = OutlinePass.BlurDirectionY;
+				renderer.setRenderTarget( this.renderTargetEdgeBuffer1 );
+				renderer.clear();
+				this._fsQuad.render( renderer );
+
+				// Apply Blur on quarter res
+				this._fsQuad.material = this.separableBlurMaterial2;
+				this.separableBlurMaterial2.uniforms[ 'colorTexture' ].value = this.renderTargetEdgeBuffer1.texture;
+				this.separableBlurMaterial2.uniforms[ 'direction' ].value = OutlinePass.BlurDirectionX;
+				renderer.setRenderTarget( this.renderTargetBlurBuffer2 );
+				renderer.clear();
+				this._fsQuad.render( renderer );
+				this.separableBlurMaterial2.uniforms[ 'colorTexture' ].value = this.renderTargetBlurBuffer2.texture;
+				this.separableBlurMaterial2.uniforms[ 'direction' ].value = OutlinePass.BlurDirectionY;
+				renderer.setRenderTarget( this.renderTargetEdgeBuffer2 );
+				renderer.clear();
+				this._fsQuad.render( renderer );
+
+				// Blend it additively over the input texture
+				this._fsQuad.material = this.overlayMaterial;
+				this.overlayMaterial.uniforms[ 'maskTexture' ].value = this.renderTargetMaskBuffer.texture;
+				this.overlayMaterial.uniforms[ 'edgeTexture1' ].value = this.renderTargetEdgeBuffer1.texture;
+				this.overlayMaterial.uniforms[ 'edgeTexture2' ].value = this.renderTargetEdgeBuffer2.texture;
+				this.overlayMaterial.uniforms[ 'patternTexture' ].value = this.patternTexture;
+				this.overlayMaterial.uniforms[ 'edgeStrength' ].value = this.edgeStrength;
+				this.overlayMaterial.uniforms[ 'edgeGlow' ].value = this.edgeGlow;
+				this.overlayMaterial.uniforms[ 'usePatternTexture' ].value = this.usePatternTexture;
+
+
+				if ( maskActive ) renderer.state.buffers.stencil.setTest( true );
+
+				renderer.setRenderTarget( readBuffer );
+				this._fsQuad.render( renderer );
+
+			} finally {
+
+				renderer.setClearColor( this._oldClearColor, this.oldClearAlpha );
+				renderer.autoClear = oldAutoClear;
+
+				if ( maskActive ) renderer.state.buffers.stencil.setTest( true );
 
 			}
-
-			// 3. Apply Edge Detection Pass
-			this._fsQuad.material = this.edgeDetectionMaterial;
-			this.edgeDetectionMaterial.uniforms[ 'maskTexture' ].value = this.renderTargetMaskDownSampleBuffer.texture;
-			this.edgeDetectionMaterial.uniforms[ 'texSize' ].value.set( this.renderTargetMaskDownSampleBuffer.width, this.renderTargetMaskDownSampleBuffer.height );
-			this.edgeDetectionMaterial.uniforms[ 'visibleEdgeColor' ].value = this.tempPulseColor1;
-			this.edgeDetectionMaterial.uniforms[ 'hiddenEdgeColor' ].value = this.tempPulseColor2;
-			renderer.setRenderTarget( this.renderTargetEdgeBuffer1 );
-			renderer.clear();
-			this._fsQuad.render( renderer );
-
-			// 4. Apply Blur on Half res
-			this._fsQuad.material = this.separableBlurMaterial1;
-			this.separableBlurMaterial1.uniforms[ 'colorTexture' ].value = this.renderTargetEdgeBuffer1.texture;
-			this.separableBlurMaterial1.uniforms[ 'direction' ].value = OutlinePass.BlurDirectionX;
-			this.separableBlurMaterial1.uniforms[ 'kernelRadius' ].value = this.edgeThickness;
-			renderer.setRenderTarget( this.renderTargetBlurBuffer1 );
-			renderer.clear();
-			this._fsQuad.render( renderer );
-			this.separableBlurMaterial1.uniforms[ 'colorTexture' ].value = this.renderTargetBlurBuffer1.texture;
-			this.separableBlurMaterial1.uniforms[ 'direction' ].value = OutlinePass.BlurDirectionY;
-			renderer.setRenderTarget( this.renderTargetEdgeBuffer1 );
-			renderer.clear();
-			this._fsQuad.render( renderer );
-
-			// Apply Blur on quarter res
-			this._fsQuad.material = this.separableBlurMaterial2;
-			this.separableBlurMaterial2.uniforms[ 'colorTexture' ].value = this.renderTargetEdgeBuffer1.texture;
-			this.separableBlurMaterial2.uniforms[ 'direction' ].value = OutlinePass.BlurDirectionX;
-			renderer.setRenderTarget( this.renderTargetBlurBuffer2 );
-			renderer.clear();
-			this._fsQuad.render( renderer );
-			this.separableBlurMaterial2.uniforms[ 'colorTexture' ].value = this.renderTargetBlurBuffer2.texture;
-			this.separableBlurMaterial2.uniforms[ 'direction' ].value = OutlinePass.BlurDirectionY;
-			renderer.setRenderTarget( this.renderTargetEdgeBuffer2 );
-			renderer.clear();
-			this._fsQuad.render( renderer );
-
-			// Blend it additively over the input texture
-			this._fsQuad.material = this.overlayMaterial;
-			this.overlayMaterial.uniforms[ 'maskTexture' ].value = this.renderTargetMaskBuffer.texture;
-			this.overlayMaterial.uniforms[ 'edgeTexture1' ].value = this.renderTargetEdgeBuffer1.texture;
-			this.overlayMaterial.uniforms[ 'edgeTexture2' ].value = this.renderTargetEdgeBuffer2.texture;
-			this.overlayMaterial.uniforms[ 'patternTexture' ].value = this.patternTexture;
-			this.overlayMaterial.uniforms[ 'edgeStrength' ].value = this.edgeStrength;
-			this.overlayMaterial.uniforms[ 'edgeGlow' ].value = this.edgeGlow;
-			this.overlayMaterial.uniforms[ 'usePatternTexture' ].value = this.usePatternTexture;
-
-
-			if ( maskActive ) renderer.state.buffers.stencil.setTest( true );
-
-			renderer.setRenderTarget( readBuffer );
-			this._fsQuad.render( renderer );
-
-			renderer.setClearColor( this._oldClearColor, this.oldClearAlpha );
-			renderer.autoClear = oldAutoClear;
 
 		}
 
@@ -456,6 +518,7 @@ class OutlinePass extends Pass {
 		}
 
 		cache.clear();
+		this._instanceFilterMeshes.length = 0;
 
 		for ( let i = 0; i < this.selectedObjects.length; i ++ ) {
 
@@ -466,65 +529,255 @@ class OutlinePass extends Pass {
 
 	}
 
-	_changeVisibilityOfSelectedObjects( bVisible ) {
+	_hasInstanceSelection() {
 
-		const cache = this._visibilityCache;
+		for ( const ids of this.selectedInstances.values() ) {
 
-		for ( const mesh of this._selectionCache ) {
+			if ( ids.size > 0 ) return true;
 
-			if ( bVisible === true ) {
+		}
 
-				mesh.visible = cache.get( mesh );
+		return false;
 
-			} else {
+	}
 
-				cache.set( mesh, mesh.visible );
-				mesh.visible = bVisible;
+	/**
+	 * Selects individual instances of an `InstancedMesh`. Out-of-range and
+	 * non-integer IDs are ignored. Pass an empty array (or no IDs) to clear the
+	 * per-instance selection of the given mesh. If the mesh is also part of
+	 * {@link OutlinePass#selectedObjects}, the whole-object selection takes
+	 * precedence and every instance is outlined.
+	 *
+	 * @param {InstancedMesh} instancedMesh - The instanced mesh to select from.
+	 * @param {Array<number>} instanceIds - The selected instance IDs.
+	 */
+	setSelectedInstances( instancedMesh, instanceIds ) {
+
+		if ( instancedMesh === null || instancedMesh === undefined || ! instancedMesh.isInstancedMesh ) {
+
+			throw new Error( 'OutlinePass: setSelectedInstances expects an InstancedMesh.' );
+
+		}
+
+		const ids = new Set();
+		const count = instancedMesh.count;
+
+		if ( instanceIds !== undefined && instanceIds !== null ) {
+
+			for ( const id of instanceIds ) {
+
+				if ( Number.isInteger( id ) && id >= 0 && id < count ) ids.add( id );
 
 			}
+
+		}
+
+		if ( ids.size === 0 ) {
+
+			this.selectedInstances.delete( instancedMesh );
+
+		} else {
+
+			this.selectedInstances.set( instancedMesh, ids );
 
 		}
 
 	}
 
-	_changeVisibilityOfNonSelectedObjects( bVisible ) {
+	/**
+	 * Clears all per-instance selections. Whole-object selections in
+	 * {@link OutlinePass#selectedObjects} are not affected.
+	 */
+	clearSelectedInstances() {
+
+		this.selectedInstances.clear();
+
+	}
+
+	_updateInstanceSelectionTextures() {
+
+		const cache = this._instanceSelectionCache;
+		const filterMeshes = this._instanceFilterMeshes;
+
+		filterMeshes.length = 0;
+
+		for ( const [ mesh, ids ] of this.selectedInstances ) {
+
+			if ( ! mesh.isInstancedMesh || this._selectionCache.has( mesh ) ) continue;
+
+			const validIds = new Set();
+
+			for ( const id of ids ) {
+
+				if ( Number.isInteger( id ) && id >= 0 && id < mesh.count ) validIds.add( id );
+
+			}
+
+			if ( validIds.size === 0 ) continue;
+
+			const data = new Uint8Array( mesh.count );
+
+			for ( const id of validIds ) data[ id ] = 1;
+
+			let texture = cache.get( mesh );
+
+			if ( texture === undefined ) {
+
+				texture = new DataTexture( data, mesh.count, 1, RedFormat, UnsignedByteType );
+				texture.minFilter = NearestFilter;
+				texture.magFilter = NearestFilter;
+				texture.generateMipmaps = false;
+				texture.needsUpdate = true;
+				cache.set( mesh, texture );
+
+			} else {
+
+				if ( texture.image.data.length !== data.length ) {
+
+					texture.image.data = data;
+					texture.image.width = mesh.count;
+					texture.needsUpdate = true;
+
+				} else {
+
+					texture.image.data.set( data );
+
+				}
+
+				texture.needsUpdate = true;
+
+			}
+
+			filterMeshes.push( mesh );
+
+		}
+
+	}
+
+	_setupInstanceFilter( material, useOnBeforeCompile ) {
+
+		const uniforms = {
+			useInstanceFilter: { value: 0 },
+			instanceSelectionMap: { value: null }
+		};
+
+		const filterExpression = 'texture2D( instanceSelectionMap, vec2( ( vOutlineInstanceId + 0.5 ) / float( textureSize( instanceSelectionMap, 0 ).x ), 0.5 ) ).r';
+		const vertexChunk = '#ifdef USE_INSTANCING\n\tvarying float vOutlineInstanceId;\n#endif\n';
+		const vertexMainChunk = '#ifdef USE_INSTANCING\n\tvOutlineInstanceId = float( gl_InstanceID );\n#endif\n';
+		const fragmentChunk = '#ifdef USE_INSTANCING\n\tvarying float vOutlineInstanceId;\n\tuniform bool useInstanceFilter;\n\tuniform sampler2D instanceSelectionMap;\n#endif\n';
+		const fragmentMainChunk = '#ifdef USE_INSTANCING\n\tif ( useInstanceFilter ) {\n\t\tfloat selected = ' + filterExpression + ';\n\t\tif ( selected < 0.5 ) discard;\n\t}\n#endif\n';
+
+		if ( useOnBeforeCompile ) {
+
+			material.onBeforeCompile = ( shader ) => {
+
+				shader.uniforms.useInstanceFilter = uniforms.useInstanceFilter;
+				shader.uniforms.instanceSelectionMap = uniforms.instanceSelectionMap;
+
+				shader.vertexShader = shader.vertexShader
+					.replace( '#include <common>', '#include <common>\n' + vertexChunk )
+					.replace( '#include <project_vertex>', vertexMainChunk + '\t#include <project_vertex>' );
+
+				shader.fragmentShader = shader.fragmentShader
+					.replace( '#include <common>', '#include <common>\n' + fragmentChunk )
+					.replace( 'void main() {', 'void main() {\n' + fragmentMainChunk );
+
+			};
+
+			material.customProgramCacheKey = () => 'OutlinePassInstanceFilter';
+
+		} else {
+
+			material.uniforms.useInstanceFilter = uniforms.useInstanceFilter;
+			material.uniforms.instanceSelectionMap = uniforms.instanceSelectionMap;
+
+		}
+
+		material._instanceFilterUniforms = uniforms;
+
+	}
+
+	_bindInstanceFilter( material ) {
+
+		const uniforms = material._instanceFilterUniforms;
+		const cache = this._instanceSelectionCache;
+
+		uniforms.useInstanceFilter.value = 1;
+
+		this._instanceFilterCallback = ( renderer, scene, camera, geometry, instanceMesh ) => {
+
+			uniforms.instanceSelectionMap.value = cache.get( instanceMesh ) || null;
+
+		};
+
+		for ( const mesh of this._instanceFilterMeshes ) {
+
+			mesh._outlinePassOnBeforeRender = mesh.onBeforeRender;
+			mesh.onBeforeRender = this._instanceFilterCallback;
+
+		}
+
+	}
+
+	_unbindInstanceFilter( material ) {
+
+		for ( const mesh of this._instanceFilterMeshes ) {
+
+			mesh.onBeforeRender = mesh._outlinePassOnBeforeRender;
+			delete mesh._outlinePassOnBeforeRender;
+
+		}
+
+		material._instanceFilterUniforms.useInstanceFilter.value = 0;
+		material._instanceFilterUniforms.instanceSelectionMap.value = null;
+		this._instanceFilterCallback = null;
+
+	}
+
+	_setSceneVisibility( mode ) {
 
 		const visibilityCache = this._visibilityCache;
 		const selectionCache = this._selectionCache;
+		const instanceSet = new Set( this._instanceFilterMeshes );
 
-		function VisibilityChangeCallBack( object ) {
+		function cacheVisibility( object ) {
+
+			if ( ! visibilityCache.has( object ) ) visibilityCache.set( object, object.visible );
+
+		}
+
+		function applyVisibility( object ) {
+
+			cacheVisibility( object );
+
+			const isSelectedMesh = selectionCache.has( object );
+			const isPartialInstance = instanceSet.has( object );
 
 			if ( object.isPoints || object.isLine || object.isLine2 ) {
 
 				// the visibility of points and lines is always set to false in order to
 				// not affect the outline computation
-
-				if ( bVisible === true ) {
-
-					object.visible = visibilityCache.get( object ); // restore
-
-				} else {
-
-					visibilityCache.set( object, object.visible );
-					object.visible = bVisible;
-
-				}
+				object.visible = false;
 
 			} else if ( object.isMesh || object.isSprite ) {
 
-				// only meshes and sprites are supported by OutlinePass
+				switch ( mode ) {
 
-				if ( ! selectionCache.has( object ) ) {
+					case 'depth-main':
+						object.visible = ! isSelectedMesh && ! isPartialInstance;
+						break;
 
-					const visibility = object.visible;
+					case 'depth-instances':
+						object.visible = isPartialInstance;
+						break;
 
-					if ( bVisible === false || visibilityCache.get( object ) === true ) {
+					case 'mask-main':
+						object.visible = isSelectedMesh && ! isPartialInstance;
+						break;
 
-						object.visible = bVisible;
-
-					}
-
-					visibilityCache.set( object, visibility );
+					case 'mask-instances':
+						object.visible = isPartialInstance;
+						break;
 
 				}
 
@@ -532,7 +785,13 @@ class OutlinePass extends Pass {
 
 		}
 
-		this.renderScene.traverse( VisibilityChangeCallBack );
+		this.renderScene.traverse( applyVisibility );
+
+	}
+
+	_restoreSceneVisibility() {
+
+		for ( const [ object, visible ] of this._visibilityCache ) object.visible = visible;
 
 	}
 
@@ -549,18 +808,24 @@ class OutlinePass extends Pass {
 
 	_getPrepareMaskMaterial() {
 
-		return new ShaderMaterial( {
+		const material = new ShaderMaterial( {
 
 			uniforms: {
 				'depthTexture': { value: null },
 				'cameraNearFar': { value: new Vector2( 0.5, 0.5 ) },
-				'textureMatrix': { value: null }
+				'textureMatrix': { value: null },
+				'useInstanceFilter': { value: 0 },
+				'instanceSelectionMap': { value: null }
 			},
 
 			vertexShader:
 				`#include <batching_pars_vertex>
 				#include <morphtarget_pars_vertex>
 				#include <skinning_pars_vertex>
+
+				#ifdef USE_INSTANCING
+					varying float vOutlineInstanceId;
+				#endif
 
 				varying vec4 projTexCoord;
 				varying vec4 vPosition;
@@ -573,6 +838,11 @@ class OutlinePass extends Pass {
 					#include <begin_vertex>
 					#include <morphtarget_vertex>
 					#include <skinning_vertex>
+
+					#ifdef USE_INSTANCING
+						vOutlineInstanceId = float( gl_InstanceID );
+					#endif
+
 					#include <project_vertex>
 
 					vPosition = mvPosition;
@@ -593,12 +863,24 @@ class OutlinePass extends Pass {
 
 			fragmentShader:
 				`#include <packing>
+				#ifdef USE_INSTANCING
+					varying float vOutlineInstanceId;
+					uniform bool useInstanceFilter;
+					uniform sampler2D instanceSelectionMap;
+				#endif
 				varying vec4 vPosition;
 				varying vec4 projTexCoord;
 				uniform sampler2D depthTexture;
 				uniform vec2 cameraNearFar;
 
 				void main() {
+
+					#ifdef USE_INSTANCING
+						if ( useInstanceFilter ) {
+							float selected = texture2D( instanceSelectionMap, vec2( ( vOutlineInstanceId + 0.5 ) / float( textureSize( instanceSelectionMap, 0 ).x ), 0.5 ) ).r;
+							if ( selected < 0.5 ) discard;
+						}
+					#endif
 
 					float depth = unpackRGBAToDepth(texture2DProj( depthTexture, projTexCoord ));
 					float viewZ = - DEPTH_TO_VIEW_Z( depth, cameraNearFar.x, cameraNearFar.y );
@@ -608,6 +890,10 @@ class OutlinePass extends Pass {
 				}`
 
 		} );
+
+		this._setupInstanceFilter( material, false );
+
+		return material;
 
 	}
 

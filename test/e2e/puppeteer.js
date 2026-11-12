@@ -83,7 +83,11 @@ const exceptionList = [
 
 	// Webcam
 	'webgl_materials_video_webcam',
-	'webgl_morphtargets_webcam'
+	'webgl_morphtargets_webcam',
+
+	// Covered by the dedicated script test/e2e/outline-instancing-check.js,
+	// which drives the interactive per-instance selection scenarios directly.
+	'webgl_postprocessing_outline_instancing'
 
 ];
 

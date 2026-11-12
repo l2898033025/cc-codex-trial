@@ -104,6 +104,10 @@ Default is `(256,256)`.
 
 The selected 3D objects that should receive an outline.
 
+### .selectedInstances : Map.<InstancedMesh, Set.<number>>
+
+Per-instance selection for `InstancedMesh` objects. Keys are the selected instanced meshes, values are sets of selected instance IDs. Prefer [OutlinePass#setSelectedInstances](OutlinePass.html#setSelectedInstances) over writing this map directly. An instanced mesh that is also part of [OutlinePass#selectedObjects](OutlinePass.html#selectedObjects) is outlined as a whole, and its per-instance selection is ignored.
+
 ### .usePatternTexture : boolean
 
 Whether to use a pattern texture for to highlight selected 3D objects or not.
@@ -123,6 +127,22 @@ Default is `(1,1,1)`.
 Frees the GPU-related resources allocated by this instance. Call this method whenever the pass is no longer used in your app.
 
 **Overrides:** [Pass#dispose](Pass.html#dispose)
+
+### .clearSelectedInstances()
+
+Removes every per-instance selection. Whole-object selections in [OutlinePass#selectedObjects](OutlinePass.html#selectedObjects) are not affected.
+
+### .setSelectedInstances( instancedMesh : InstancedMesh, instanceIds : Array.<number> )
+
+Selects individual instances of an `InstancedMesh`. Out-of-range and non-integer IDs are ignored, so an invalid ID never outlines the whole batch. Passing an empty array clears the per-instance selection of the given mesh. If the same mesh is also contained in [OutlinePass#selectedObjects](OutlinePass.html#selectedObjects), the whole-object selection takes precedence.
+
+**instancedMesh**
+
+The instanced mesh that holds the selected instances.
+
+**instanceIds**
+
+The instance IDs returned, for example, by `Raycaster` intersections.
 
 ### .render( renderer : WebGLRenderer, writeBuffer : WebGLRenderTarget, readBuffer : WebGLRenderTarget, deltaTime : number, maskActive : boolean )
 
