@@ -58,6 +58,8 @@
     "test": "npm run test:unit && npm run test:func",
     "test:types": "tsc --project tests/integration/dist-types",
     "test:unit": "karma start karma.conf.js",
+    "test:unit:playlist-export": "node tools/run-playlist-export-tests.cjs",
+    "demo:playlist-export": "node tools/playlist-export-demo.mjs",
     "test:unit:debug": "DEBUG_UNIT_TESTS=1 karma start karma.conf.js --auto-watch --no-single-run --browsers Chrome",
     "test:unit:watch": "karma start karma.conf.js --auto-watch --no-single-run",
     "test:func": "BABEL_ENV=development mocha --require @babel/register tests/functional/auto/setup.js --timeout 40000 --exit",

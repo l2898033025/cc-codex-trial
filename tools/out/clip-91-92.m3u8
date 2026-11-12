@@ -1,0 +1,17 @@
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:4
+#EXT-X-MEDIA-SEQUENCE:91
+#EXT-X-DISCONTINUITY-SEQUENCE:2
+#EXT-X-PROGRAM-DATE-TIME:2026-11-12T12:00:04.000Z
+#EXT-X-MAP:URI="https://example.com/live/window/init-a.mp4"
+#EXTINF:4,
+#EXT-X-BYTERANGE:1000@1000
+https://example.com/live/window/media.ts
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2026-11-12T12:00:08.000Z
+#EXT-X-MAP:URI="https://example.com/live/window/init-b.mp4"
+#EXTINF:4,
+#EXT-X-BYTERANGE:1000@2000
+https://example.com/live/window/media.ts
+#EXT-X-ENDLIST
